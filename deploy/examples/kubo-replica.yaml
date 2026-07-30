@@ -1,0 +1,106 @@
+# Standalone full-archive replica attached to an existing Kubo 0.42.x node.
+# See docs/kubo-replica.md before enabling it: Kubo remains the sole block
+# store, PeerID, Bitswap server, pin database, provider, and GC owner.
+version: 2
+net: mainnet
+
+replica:
+  # Stable local controller identity. It names only this replica's generation
+  # pin and metadata; it is not a network or writer identity.
+  id: archive-eu-1
+  state_path: /var/lib/bloar-kubo-replica
+  # Empty derives bloar-replica/v1/<id>.
+  pin_name: ""
+  # Retain the filtered finalized archive plus the bounded global live tip.
+  # The signed `all` handoff witness is deliberately not selected or pinned.
+  heads:
+    arbitrum-one:
+      kind: finalized-monotonic
+    unfinalized:
+      kind: unfinalized-mutable
+      handoff_head: all
+      max_window_slots: 64
+      overlay_finalized_head: arbitrum-one
+  # Independently re-prove that the committed anchor remains the exact named
+  # recursive pin. This audit is separate from publication polling.
+  audit_interval: 1m
+
+source:
+  # HTTPS and IPNS may be configured together for dual-channel resolution.
+  # Base URL only; the replica appends /bloar/v1/heads.
+  url: https://archive.example.org
+  ipns: ""
+  dnslink: ""
+  # Replace with the writer's 32-byte Ed25519 public key in lowercase hex.
+  pubkey: 0000000000000000000000000000000000000000000000000000000000000000
+  poll_interval: 1m
+  fetch_timeout: 30s
+
+kubo:
+  api: http://127.0.0.1:5001
+  # Matches LoadCredential= in the shipped systemd unit. A loopback-only API
+  # may instead set allow_unauthenticated: true and leave this empty.
+  bearer_token_file: /run/credentials/bloar-kubo-replica.service/kubo-api-token
+  allow_unauthenticated: false
+  allow_insecure_http: false
+  request_timeout: 30s
+  # Bounds one initial recursive pin or incremental pin update. During Kubo GC
+  # this may expire safely: the old generation stays pinned and the poll retries.
+  pin_timeout: 24h
+  # Reannounce one stable rendezvous key per head plus the current generation
+  # anchor, head roots, and manifest tips; never walk or announce the full DAG.
+  announce_interval: 12h
+  # Explicit finite ceilings for a multi-million-block initial traversal.
+  max_stream_items: 50000000
+  max_stream_bytes: 4294967296
+  pin_progress_items: 50000000
+  pin_progress_bytes: 4294967296
+
+# Optional read-only Bloar/beacon gateway. It is disabled by default and never
+# mounts ingest, refs, truncate, manifest, or generation mutation routes. To
+# serve Nitro from this replica, change enabled to true and publish the gateway
+# listener through the operator's ordinary TLS/reverse-proxy boundary.
+gateway:
+  enabled: false
+  listen: 127.0.0.1:8550
+  beacon:
+    genesis_time: 1606824023
+    seconds_per_slot: 12
+    genesis_validators_root: "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
+    genesis_fork_version: "0x00000000"
+    spec_extra:
+      DEPOSIT_CHAIN_ID: "1"
+  # The selected filtered finalized head is the retained overlay for the
+  # mutable generation. Because its signed handoff witness is metadata-only
+  # `all`, filtered live reads must enumerate versioned hashes.
+  live_heads:
+    live:
+      finalized_head: arbitrum-one
+      unfinalized_head: unfinalized
+      require_versioned_hashes: true
+  max_query_hashes: 64
+  max_response_bytes_in_flight: 1073741824
+  immutable_horizon_slots: 7200
+  read_header_timeout: 10s
+  read_timeout: 15s
+  write_timeout: 2m
+  idle_timeout: 1m
+  max_header_bytes: 65536
+  max_conns: 1024
+  # Admission is enabled by default. Set enabled: false only behind a measured
+  # and independently bounded trusted proxy.
+  public_read_admission:
+    enabled: true
+    global_rate: 256
+    global_burst: 512
+    client_rate: 64
+    client_burst: 128
+    client_buckets: 4096
+    client_bucket_ttl: 10m
+    trusted_proxy_header: ""
+    trusted_proxy_cidrs: []
+
+metrics:
+  # Exposes /metrics, /healthz, /readyz, and /replica/status. When the gateway
+  # is enabled, readiness includes its live listener.
+  listen: 127.0.0.1:9097

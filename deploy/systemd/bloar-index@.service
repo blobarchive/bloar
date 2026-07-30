@@ -1,0 +1,94 @@
+# bloar-index: one indexer instance (spec 10).
+#
+# Templated on the instance name, which names both the config file
+# (/etc/bloar/index/<instance>.yaml) and the subcommand: bloar-index takes the
+# subcommand as its first argument (spec 10's two ingest processes), and this
+# unit reads it from the instance name's prefix, up to the first '-'.
+#
+#   /etc/bloar/index/beacon-all.yaml          -> systemctl enable --now bloar-index@beacon-all
+#   /etc/bloar/index/chain-arbitrum-one.yaml  -> systemctl enable --now bloar-index@chain-arbitrum-one
+#   /etc/bloar/index/unfinalized.yaml         -> systemctl enable --now bloar-index@unfinalized
+#
+# So the prefix must be `beacon`, `chain`, or `unfinalized`. The head a chain
+# instance writes (arbitrum-one here) is named inside its config, not in the
+# instance name -- the prefix is the subcommand, so a chain head's instance is
+# chain-<head>. An instance named anything else fails at start with bloar-index's
+# own "unknown subcommand" error, which is the intended way to find out.
+#
+# See docs/operations.md.
+
+[Unit]
+Description=bloar indexer (%i)
+Documentation=https://github.com/blobarchive/bloar
+After=network-online.target
+Wants=network-online.target
+# Not Requires=bloard: an indexer is a client of the archive over HTTP (spec
+# 10), and may well point at one on another host. If it does run beside a
+# bloard, this orders it after without coupling their lifetimes -- the indexer
+# retries a refused connection, which is the same thing that happens whenever
+# the archive restarts.
+After=bloard.service
+
+[Service]
+Type=exec
+# The subcommand from the instance-name prefix; see the header. The shell is
+# systemd's own %i expansion plus /bin/sh for the cut, because systemd has no
+# string operations of its own.
+ExecStart=/bin/sh -c 'exec /usr/local/bin/bloar-index "$(echo %i | cut -d- -f1)" -config /etc/bloar/index/%i.yaml'
+
+# DynamicUser here, unlike bloard. An indexer is genuinely stateless -- spec 10
+# makes its whole progress state the archive's synced_to, read back over HTTP --
+# so it has no directory to own, nothing to chown, and no uid anything else has
+# to agree with. This is the case DynamicUser is for.
+DynamicUser=yes
+
+# The archive token (spec 7.3) reaches this transient uid as a systemd
+# credential, and it must: DynamicUser allocates a fresh, unnamed uid on every
+# start, so a 0600 /etc/bloar/token owned by any real account is unreadable to it
+# -- with Restart=always that is a deterministic crash loop, which is exactly what
+# the credential-handoff invariant found. systemd (as root) reads the source once and drops a private
+# 0400 copy, owned by this start's uid, in $CREDENTIALS_DIRECTORY. The config's
+# archive.token_file is ${CREDENTIALS_DIRECTORY}/token, expanded from the
+# environment by bloar-index (docs/operations.md §3.1). No group, ACL, or
+# world-readable token is involved: the copy is private to the one process.
+#
+# Change the source path here if it is not /etc/bloar/token; the config keeps
+# saying ${CREDENTIALS_DIRECTORY}/token either way.
+LoadCredential=token:/etc/bloar/token
+
+# It reads one config, which carries the archive's auth token. Nothing else.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# An indexer that dies is an indexer that stops archiving, and everything it
+# does is idempotent (spec 5.1's replay path), so restarting is always safe.
+Restart=always
+RestartSec=10s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bloar-index@%i
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,69 @@
+version: 2
+net: mainnet
+
+replica:
+  id: arb1-replica
+  state_path: /var/lib/bloar-kubo-replica
+  heads:
+    arbitrum-one:
+      kind: finalized-monotonic
+    unfinalized:
+      kind: unfinalized-mutable
+      handoff_head: all
+      max_window_slots: 128
+      overlay_finalized_head: arbitrum-one
+  audit_interval: 1m
+
+source:
+  dnslink: ethereum-mainnet-arb1-live-a.blobarchive.net
+  pubkey: 6698f6c8767529ffb725ce5201a86602106cc87ed7c9129a649428ca0ea6d7b5
+  poll_interval: 1m
+  fetch_timeout: 30s
+
+kubo:
+  # kubo-api resolves only to the gateway of the dedicated internal control
+  # bridge. Kubo must require the matching bearer on this non-loopback RPC.
+  api: http://kubo-api:5001
+  bearer_token_file: /run/secrets/kubo_api_token
+  allow_insecure_http: true
+  # Kubo's path-only auth cannot make /api/v0/config read-only. The operator
+  # validates provider policy on the native host instead of granting config
+  # mutation to the controller token.
+  provider_policy_check: external
+  request_timeout: 30s
+  pin_timeout: 24h
+  announce_interval: 12h
+  max_stream_items: 50000000
+  max_stream_bytes: 4294967296
+  pin_progress_items: 50000000
+  pin_progress_bytes: 4294967296
+
+gateway:
+  enabled: true
+  # Compose publishes this container listener only on host loopback.
+  listen: 0.0.0.0:8550
+  beacon:
+    genesis_time: 1606824023
+    seconds_per_slot: 12
+    genesis_validators_root: "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
+    genesis_fork_version: "0x00000000"
+    spec_extra:
+      DEPOSIT_CHAIN_ID: "1"
+  live_heads:
+    live:
+      finalized_head: arbitrum-one
+      unfinalized_head: unfinalized
+      require_versioned_hashes: true
+  max_query_hashes: 64
+  max_response_bytes_in_flight: 1073741824
+  immutable_horizon_slots: 7200
+  read_header_timeout: 10s
+  read_timeout: 15s
+  write_timeout: 2m
+  idle_timeout: 1m
+  max_header_bytes: 65536
+  max_conns: 1024
+
+metrics:
+  # Compose publishes this container listener only on host loopback.
+  listen: 0.0.0.0:9097

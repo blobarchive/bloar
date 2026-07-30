@@ -1,0 +1,58 @@
+# Base mainnet filtered-head indexer. This scans Ethereum L1 blob transactions
+# sent to Base's batch inbox by the batch sender authorized by Base SystemConfig,
+# and records only their versioned hashes in the local `base` head.
+#
+#   bloar-index chain -config /etc/bloar/index/base-mainnet.yaml
+#
+# The schedule below begins at Ethereum's Dencun activation block, the first L1
+# block that can contain an EIP-4844 blob transaction. Base SystemConfig is the
+# authority for the sender. Its ConfigUpdate history must be reviewed before
+# extending or replacing this open-ended range; do not infer a new sender from a
+# transaction merely observed at the batch inbox.
+
+# Private metrics listener; empty (the default) serves nothing.
+metrics_listen: "127.0.0.1:9551"
+
+beacon:
+  # Ethereum mainnet genesis. This maps each selected L1 block timestamp to the
+  # beacon slot under which the shared ALL head stores its blobs.
+  genesis_time: 1606824023
+  seconds_per_slot: 12
+
+archive:
+  url: http://127.0.0.1:8550
+  # Under the shipped systemd unit this expands to its private credential copy.
+  # Containers should use a readable bind-mounted path such as /etc/bloar/token.
+  token_file: "${CREDENTIALS_DIRECTORY}/token"
+  head: base
+  max_put_blobs: 64
+
+chain:
+  # A trusted Ethereum execution RPC with complete finalized block bodies.
+  parent_chain_rpc: http://127.0.0.1:8545
+
+  sources:
+    - type: blob-txs
+      # Base mainnet batch inbox.
+      address: "0xff00000000000000000000000000000000008453"
+      # Base SystemConfig batcherHash from Dencun through the initial production
+      # catalog boundary. Sender rotation is a manifest transition; close this
+      # range and append the new authoritative sender rather than broadening it.
+      senders: ["0x5050f69a9786f081509234f1a7f4684b5e5b76c9"]
+      from_block: 19426587
+
+  # Reuse blobs already retained by this archive's full Ethereum ALL head.
+  # This indexer posts refs only and therefore does not duplicate blob payloads
+  # or consume a beacon archive provider.
+  fetch_blobs: false
+  all_head: all
+
+index:
+  block_range: 1000
+  # Tune these bounded knobs to the local execution RPC and hardware. Four
+  # workers with batches of sixteen are conservative defaults; both limits are
+  # validated and the reducer preserves canonical block/transaction order.
+  block_fetch_concurrency: 4
+  rpc_batch_size: 16
+  max_put_blobs: 64
+  poll_interval: 12s

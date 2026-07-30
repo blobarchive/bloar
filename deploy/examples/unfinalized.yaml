@@ -1,0 +1,45 @@
+# The bounded optimistic indexer: publishes a complete, replaceable generation
+# above the finalized ALL frontier without mutating ALL.
+#
+#   bloar-index unfinalized -config /etc/bloar/index/unfinalized.yaml
+#
+# The trusted beacon block API supplies root-addressed canonical ancestry and
+# commitments. Blob endpoints supply only bytes, which are checked against those
+# commitments. A head change while a candidate is built discards the candidate;
+# the previously selected generation remains served.
+
+# Keep this distinct from beacon-all.yaml when both indexers run on one host.
+metrics_listen: "127.0.0.1:9553"
+
+archive:
+  url: http://127.0.0.1:8550
+  token_file: "${CREDENTIALS_DIRECTORY}/token"
+  # bloard must configure this physical head as kind=unfinalized-mutable.
+  head: unfinalized
+  # Durable local expectation, cross-checked against the live archive when it
+  # is reachable. Transport/5xx absence retains the current complete generation
+  # and retries in-process; auth/config/protocol failures still terminate.
+  max_put_blobs: 64
+
+upstream:
+  # A beacon node is normally both the blob-byte source and the trusted,
+  # root-addressed header/commitment feed. `head` is deliberately forbidden:
+  # another archive cannot attest which optimistic fork is canonical now.
+  url: http://127.0.0.1:5052
+  block_url: http://127.0.0.1:5052
+
+index:
+  max_put_blobs: 64
+  poll_interval: 12s
+
+unfinalized:
+  # Only this finalized-monotonic head authorizes retirement from the moving
+  # provisional window. It is never changed by this process.
+  handoff_head: all
+  # Three epochs on Ethereum mainnet. If finality falls far enough behind to
+  # exceed this hard bound, retain the last complete generation and surface
+  # staleness instead of growing work or memory without limit.
+  window_slots: 96
+  # Retain a small overlap behind ALL so the unified read view can switch sides
+  # without a transient gap while the two independent indexers advance.
+  overlap_slots: 8

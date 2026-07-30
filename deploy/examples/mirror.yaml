@@ -1,0 +1,62 @@
+# The beacon indexer in MIRROR mode (spec 10.1, 11.5): DETERMINISTIC REPLICATION
+# of another bloar archive's head into this one.
+#
+#   bloar-index beacon -config /etc/bloar/index/mirror.yaml
+#
+# What this does, and what it does NOT do. Mirror mode points the beacon indexer's
+# same loop at a source bloar archive's read API (the read API is the backfill
+# protocol) and rebuilds the named head here. It has NO independent block feed, so
+# it COPIES the source's coverage decisions rather than re-deriving them: a
+# covered-empty answer is recorded as empty, a 503 waits, and an in-range 404 (at or
+# above origin, the only kind the origin check lets the walk query) is a protocol
+# violation -- a genuine below-origin 404 is valid, and the check keeps the walk from
+# ever querying one. KZG still anchors every blob the source SERVES against its
+# versioned hash, so the source cannot forge bytes -- but a real blob the source
+# silently dropped is reproduced here, not caught.
+#
+# So the head root this produces MUST equal the source's for the same parameters,
+# and that equality is a proof of FAITHFUL REPRODUCTION (and byte validity of what
+# was served), NOT a proof that the source is complete. Completeness is INHERITED
+# from the source. To audit an archive's completeness instead of copying it, use
+# ANCHORED mode against an independent beacon node (see backfill-all.yaml /
+# beacon-all.yaml and operations.md section 7.4).
+
+# Private metrics listener; empty (the default) serves nothing. See beacon-all.yaml
+# for the metric families this adds over the shared daemon family (spec 10.1).
+metrics_listen: "127.0.0.1:9551"
+
+archive:
+  # The LOCAL archive this indexer writes the replicated head into.
+  url: http://127.0.0.1:8550
+  # SYSTEMD form: bloar-index@.service delivers /etc/bloar/token as a credential
+  #, and this path
+  # expands from the environment to the private per-unit copy. MANUAL / CONTAINER
+  # / docker-compose has no credential directory: use a plain readable path, e.g.
+  # `token_file: /etc/bloar/token`. See beacon-all.yaml and docs/operations.md
+  # §3.1.
+  token_file: "${CREDENTIALS_DIRECTORY}/token"
+  head: all
+  # Durable local expectation, cross-checked against the live archive when it
+  # is reachable. A mismatch is fatal; temporary unavailability is not.
+  max_put_blobs: 64
+
+upstream:
+  # The SOURCE archive being replicated: its read API is the one and only source.
+  url: https://source-archive.example.org
+  # head SELECTS MIRROR MODE. It must be set, and it names which of the source's
+  # heads to reproduce. Setting it is what tells the indexer the upstream is a
+  # bloar archive (so an in-range 404 is a protocol violation, not absence) and
+  # that its finality is the source head's synced_to. There is no block_url and no
+  # fallback in mirror mode -- a mirror trusts its one source for existence, which
+  # is exactly why it is replication and not an independent check.
+  head: all
+
+index:
+  # Slots per refs batch (B in spec 10.1's loop).
+  batch_size: 64
+  # How many of a batch's slots to read from the source at once; 1 is serial.
+  fetch_concurrency: 6
+  # Must not exceed the local archive's server.max_put_blobs (spec 7.2, default 64).
+  max_put_blobs: 64
+  # How long to sleep once caught up with the source head's synced_to.
+  poll_interval: 12s

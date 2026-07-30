@@ -1,0 +1,73 @@
+services:
+  replica:
+    # Fail closed until the operator supplies the immutable digest published
+    # with a GitHub Release. Tags, including v0.X.Y and latest, are mutable.
+    image: ghcr.io/blobarchive/bloar@${BLOAR_IMAGE_DIGEST:?Set BLOAR_IMAGE_DIGEST to the sha256 digest from a verified release}
+    restart: unless-stopped
+    init: true
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: ${BLOAR_PIDS_LIMIT:-512}
+    mem_limit: ${BLOAR_MEMORY_LIMIT:-8g}
+    cpus: ${BLOAR_CPUS:-4.0}
+    stop_grace_period: 3m
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192
+    entrypoint: ["/bloar-kubo-replica"]
+    command: ["-config", "/etc/bloar/kubo-replica.yaml"]
+    healthcheck:
+      test: ["CMD", "/bloar-kubo-replica", "-config", "/etc/bloar/kubo-replica.yaml", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5m
+      retries: 3
+    ports:
+      - "127.0.0.1:${BLOAR_HTTP_PORT:-8550}:8550"
+      - "127.0.0.1:${BLOAR_METRICS_PORT:-9097}:9097"
+    extra_hosts:
+      - "kubo-api:${KUBO_CONTROL_GATEWAY:-172.30.189.1}"
+    networks:
+      - default
+      - kubo-control
+    volumes:
+      - type: bind
+        source: ./kubo-replica.yaml
+        target: /etc/bloar/kubo-replica.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./kubo-api-token
+        target: /run/secrets/kubo_api_token
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./state
+        target: /var/lib/bloar-kubo-replica
+        bind:
+          create_host_path: false
+    # The image declares both role state paths as volumes. Explicitly shadow
+    # the unused embedded-store path so Docker cannot create a hidden
+    # anonymous writable volume behind read_only.
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=65532,gid=65532,mode=0700
+      - /var/lib/bloar:rw,noexec,nosuid,nodev,size=1m,uid=65532,gid=65532,mode=0700
+    logging:
+      driver: json-file
+      options:
+        max-size: ${BLOAR_LOG_MAX_SIZE:-10m}
+        max-file: "${BLOAR_LOG_MAX_FILES:-3}"
+
+networks:
+  kubo-control:
+    # This stable, operator-created bridge remains while the controller is
+    # stopped because the native Kubo daemon binds its RPC to the gateway.
+    external: true
+    name: ${KUBO_CONTROL_NETWORK:-bloar-kubo-control}

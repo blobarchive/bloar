@@ -1,0 +1,421 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v0.*.*"
+
+permissions: {}
+
+concurrency:
+  # Serialize the entire stable release, including human approval and GitHub
+  # Release creation. An older approved run must never race a newer tag and
+  # move either latest pointer backward.
+  group: bloar-stable-release
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: blobarchive/bloar
+  EDGE_IMAGE_NAME: blobarchive/bloar-edge
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            conformance/go.sum
+
+      - name: Verify release authority
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v0\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release tag must be a stable v0.X.Y" >&2
+            exit 1
+          fi
+
+          # The release line is intentionally one monotonically increasing v0
+          # line. This prevents an older hotfix tag from moving latest backward.
+          newest="$(git tag --list 'v0.*.*' \
+            | grep -E '^v0\.[0-9]+\.[0-9]+$' \
+            | sort -V \
+            | tail -n 1)"
+          test "$newest" = "$GITHUB_REF_NAME" || {
+            echo "$GITHUB_REF_NAME is not the newest stable v0 tag ($newest)" >&2
+            exit 1
+          }
+
+          git fetch --no-tags origin \
+            '+refs/heads/main:refs/remotes/origin/main'
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main || {
+            echo "release commit is not on origin/main" >&2
+            exit 1
+          }
+
+          protected="$(gh api \
+            "repos/$GITHUB_REPOSITORY/branches/main" \
+            --jq '.protected')"
+          test "$protected" = true || {
+            echo "main is not protected by a branch ruleset" >&2
+            exit 1
+          }
+
+          tag_ref="$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME")"
+          tag_type="$(jq -r '.object.type' <<<"$tag_ref")"
+          tag_object="$(jq -r '.object.sha' <<<"$tag_ref")"
+          test "$tag_type" = tag || {
+            echo "release tag must be an annotated, signed tag" >&2
+            exit 1
+          }
+          tag_json="$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/tags/$tag_object")"
+          test "$(jq -r '.verification.verified' <<<"$tag_json")" = true || {
+            jq -r '"tag signature is not verified: " + .verification.reason' \
+              <<<"$tag_json" >&2
+            exit 1
+          }
+          test "$(jq -r '.object.type' <<<"$tag_json")" = commit
+          test "$(jq -r '.object.sha' <<<"$tag_json")" = "$GITHUB_SHA"
+
+      - name: Supply-chain policy
+        run: make supply-chain-check
+
+      - name: Build, test, and lint
+        run: |
+          make build
+          make test
+          make lint
+
+      - name: Pinned dependency graphs and vulnerability scan
+        run: |
+          make dependency-check
+          make vulncheck
+
+      - name: P2P smoke tests
+        run: make p2p-smoke
+
+      - name: Nitro conformance
+        run: make conformance
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-24.04
+    environment:
+      # Repository settings must require interactive approval by the designated
+      # human release maintainer and restrict this environment to release tags.
+      # This is a single-human gate; reviewer and automation-token permissions
+      # must be verified in GitHub. See docs/releases.md.
+      name: release
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    outputs:
+      bloar_digest: ${{ steps.push_bloar.outputs.digest }}
+      edge_digest: ${{ steps.push_edge.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Set reproducible release inputs
+        id: release
+        run: |
+          set -euo pipefail
+          created="$(git show -s --format=%cI "$GITHUB_SHA")"
+          context="$RUNNER_TEMP/bloar-build-context"
+          snapshot="$RUNNER_TEMP/bloar-vcs-snapshot.tar"
+          scripts/create-build-context.sh "$context" "$GITHUB_SHA"
+          scripts/create-build-vcs-snapshot.sh "$snapshot" "$GITHUB_SHA"
+          {
+            echo "created=$created"
+            echo "build_context=$context"
+            echo "vcs_snapshot=$snapshot"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.0.4@sha256:8f58e6214f4cc9dc83ce8f5acad1ece508eb6b20e696a8c1e9f274481982c541
+          platforms: arm64
+          cache-image: false
+
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+        with:
+          version: v0.30.1
+          driver-opts: image=docker.io/moby/buildkit:buildx-stable-1@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Publish version tags only. Both latest tags are promoted from these exact
+      # digests only after every binary, label, SBOM, and attestation check passes.
+      - name: Build and push amd64 and arm64 Bloar image
+        id: push_bloar
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: ${{ steps.release.outputs.build_context }}
+          file: ${{ github.workspace }}/deploy/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          # BuildKit deliberately excludes secret contents and even required
+          # secret presence from its cache key. Do not let a prior successful
+          # layer bypass this release's VCS snapshot checks.
+          no-cache: true
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.created=${{ steps.release.outputs.created }}
+          build-args: |
+            VCS_REF=${{ github.sha }}
+            BUILD_DATE=${{ steps.release.outputs.created }}
+            SOURCE_URL=https://github.com/${{ github.repository }}
+            MODULE_PATH=github.com/blobarchive/bloar
+          secret-files: |
+            vcs_snapshot=${{ steps.release.outputs.vcs_snapshot }}
+          sbom: true
+          provenance: mode=max
+
+      - name: Build and push amd64 and arm64 edge image
+        id: push_edge
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: ${{ steps.release.outputs.build_context }}
+          file: ${{ github.workspace }}/deploy/Dockerfile
+          target: edge
+          platforms: linux/amd64,linux/arm64
+          no-cache: true
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.EDGE_IMAGE_NAME }}:${{ github.ref_name }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.created=${{ steps.release.outputs.created }}
+          build-args: |
+            VCS_REF=${{ github.sha }}
+            BUILD_DATE=${{ steps.release.outputs.created }}
+            SOURCE_URL=https://github.com/${{ github.repository }}
+            MODULE_PATH=github.com/blobarchive/bloar
+          secret-files: |
+            vcs_snapshot=${{ steps.release.outputs.vcs_snapshot }}
+          sbom: true
+          provenance: mode=max
+
+      - name: Verify immutable Bloar image, binaries, labels, SBOM, and provenance
+        id: verify_bloar
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push_bloar.outputs.digest }}
+        run: |
+          set -euo pipefail
+          scripts/verify-release-image.sh \
+            "$IMAGE_REF" "$GITHUB_SHA" release-evidence/bloar bloar
+          source release-evidence/bloar/child-digests.env
+          {
+            echo "amd64_digest=$AMD64_DIGEST"
+            echo "arm64_digest=$ARM64_DIGEST"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify immutable edge image, binary, labels, SBOM, and provenance
+        id: verify_edge
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.EDGE_IMAGE_NAME }}@${{ steps.push_edge.outputs.digest }}
+        run: |
+          set -euo pipefail
+          scripts/verify-release-image.sh \
+            "$IMAGE_REF" "$GITHUB_SHA" release-evidence/edge edge
+          source release-evidence/edge/child-digests.env
+          {
+            echo "amd64_digest=$AMD64_DIGEST"
+            echo "arm64_digest=$ARM64_DIGEST"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Attest Bloar image-index provenance
+        uses: actions/attest@c32b4b8b198b65d0bd9d63490e847ff7b53989d4 # v4.0.0
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push_bloar.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest Bloar amd64 SBOM
+        uses: actions/attest@c32b4b8b198b65d0bd9d63490e847ff7b53989d4 # v4.0.0
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.verify_bloar.outputs.amd64_digest }}
+          sbom-path: release-evidence/bloar/sbom-amd64.spdx.json
+          push-to-registry: true
+
+      - name: Attest Bloar arm64 SBOM
+        uses: actions/attest@c32b4b8b198b65d0bd9d63490e847ff7b53989d4 # v4.0.0
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.verify_bloar.outputs.arm64_digest }}
+          sbom-path: release-evidence/bloar/sbom-arm64.spdx.json
+          push-to-registry: true
+
+      - name: Attest edge image-index provenance
+        uses: actions/attest@c32b4b8b198b65d0bd9d63490e847ff7b53989d4 # v4.0.0
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.EDGE_IMAGE_NAME }}
+          subject-digest: ${{ steps.push_edge.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest edge amd64 SBOM
+        uses: actions/attest@c32b4b8b198b65d0bd9d63490e847ff7b53989d4 # v4.0.0
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.EDGE_IMAGE_NAME }}
+          subject-digest: ${{ steps.verify_edge.outputs.amd64_digest }}
+          sbom-path: release-evidence/edge/sbom-amd64.spdx.json
+          push-to-registry: true
+
+      - name: Attest edge arm64 SBOM
+        uses: actions/attest@c32b4b8b198b65d0bd9d63490e847ff7b53989d4 # v4.0.0
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.EDGE_IMAGE_NAME }}
+          subject-digest: ${{ steps.verify_edge.outputs.arm64_digest }}
+          sbom-path: release-evidence/edge/sbom-arm64.spdx.json
+          push-to-registry: true
+
+      - name: Verify all signed GitHub attestations
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BLOAR_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          BLOAR_INDEX_DIGEST: ${{ steps.push_bloar.outputs.digest }}
+          BLOAR_AMD64_DIGEST: ${{ steps.verify_bloar.outputs.amd64_digest }}
+          BLOAR_ARM64_DIGEST: ${{ steps.verify_bloar.outputs.arm64_digest }}
+          EDGE_IMAGE: ${{ env.REGISTRY }}/${{ env.EDGE_IMAGE_NAME }}
+          EDGE_INDEX_DIGEST: ${{ steps.push_edge.outputs.digest }}
+          EDGE_AMD64_DIGEST: ${{ steps.verify_edge.outputs.amd64_digest }}
+          EDGE_ARM64_DIGEST: ${{ steps.verify_edge.outputs.arm64_digest }}
+        run: |
+          set -euo pipefail
+          common=(
+            --repo "$GITHUB_REPOSITORY"
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
+            --source-digest "$GITHUB_SHA"
+            --source-ref "$GITHUB_REF"
+          )
+          gh attestation verify \
+            "oci://$BLOAR_IMAGE@$BLOAR_INDEX_DIGEST" "${common[@]}"
+          gh attestation verify \
+            "oci://$BLOAR_IMAGE@$BLOAR_AMD64_DIGEST" "${common[@]}" \
+            --predicate-type https://spdx.dev/Document/v2.3
+          gh attestation verify \
+            "oci://$BLOAR_IMAGE@$BLOAR_ARM64_DIGEST" "${common[@]}" \
+            --predicate-type https://spdx.dev/Document/v2.3
+          gh attestation verify \
+            "oci://$EDGE_IMAGE@$EDGE_INDEX_DIGEST" "${common[@]}"
+          gh attestation verify \
+            "oci://$EDGE_IMAGE@$EDGE_AMD64_DIGEST" "${common[@]}" \
+            --predicate-type https://spdx.dev/Document/v2.3
+          gh attestation verify \
+            "oci://$EDGE_IMAGE@$EDGE_ARM64_DIGEST" "${common[@]}" \
+            --predicate-type https://spdx.dev/Document/v2.3
+
+      - name: Recheck monotonic release authority
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin
+          test "$(git rev-list -n 1 "$GITHUB_REF_NAME")" = "$GITHUB_SHA" || {
+            echo "release tag no longer targets this exact source commit" >&2
+            exit 1
+          }
+          newest="$(git tag --list 'v0.*.*' \
+            | grep -E '^v0\.[0-9]+\.[0-9]+$' \
+            | sort -V \
+            | tail -n 1)"
+          test "$newest" = "$GITHUB_REF_NAME" || {
+            echo "$GITHUB_REF_NAME is no longer the newest stable v0 tag ($newest)" >&2
+            exit 1
+          }
+
+      - name: Promote both verified digests to latest
+        env:
+          BLOAR_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          BLOAR_DIGEST: ${{ steps.push_bloar.outputs.digest }}
+          EDGE_IMAGE: ${{ env.REGISTRY }}/${{ env.EDGE_IMAGE_NAME }}
+          EDGE_DIGEST: ${{ steps.push_edge.outputs.digest }}
+        run: |
+          set -euo pipefail
+          promote() {
+            image=$1
+            digest=$2
+            docker buildx imagetools create \
+              --tag "$image:latest" \
+              "$image@$digest"
+            latest_digest="$(docker buildx imagetools inspect "$image:latest" \
+              --format '{{ json .Manifest }}' | jq -r '.digest')"
+            test "$latest_digest" = "$digest"
+          }
+          promote "$BLOAR_IMAGE" "$BLOAR_DIGEST"
+          promote "$EDGE_IMAGE" "$EDGE_DIGEST"
+
+  release:
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Create immutable digest handoff
+        env:
+          BLOAR_DIGEST: ${{ needs.publish.outputs.bloar_digest }}
+          EDGE_DIGEST: ${{ needs.publish.outputs.edge_digest }}
+        run: |
+          set -euo pipefail
+          for digest in "$BLOAR_DIGEST" "$EDGE_DIGEST"; do
+            case "$digest" in
+              sha256:????????????????????????????????????????????????????????????????) ;;
+              *) echo "publish job returned an invalid digest: $digest" >&2; exit 1 ;;
+            esac
+            case "${digest#sha256:}" in
+              *[!0-9a-f]*) echo "publish job returned a non-hex digest: $digest" >&2; exit 1 ;;
+            esac
+          done
+          asset="bloar-${GITHUB_REF_NAME}-image.env"
+          {
+            echo "BLOAR_IMAGE_DIGEST=$BLOAR_DIGEST"
+            echo "BLOAR_IMAGE=ghcr.io/blobarchive/bloar@$BLOAR_DIGEST"
+            echo "BLOAR_EDGE_IMAGE_DIGEST=$EDGE_DIGEST"
+            echo "BLOAR_EDGE_IMAGE=ghcr.io/blobarchive/bloar-edge@$EDGE_DIGEST"
+          } > "$asset"
+          echo "asset=$asset" >> "$GITHUB_ENV"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BLOAR_DIGEST: ${{ needs.publish.outputs.bloar_digest }}
+          EDGE_DIGEST: ${{ needs.publish.outputs.edge_digest }}
+        run: |
+          notes="$(printf '%s\n%s\n' \
+            "Immutable Bloar image: \`ghcr.io/blobarchive/bloar@$BLOAR_DIGEST\`" \
+            "Immutable public-edge image: \`ghcr.io/blobarchive/bloar-edge@$EDGE_DIGEST\`")"
+          gh release create "$GITHUB_REF_NAME" "$asset#Immutable image digests" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            --notes "$notes" \
+            --title "$GITHUB_REF_NAME"

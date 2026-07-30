@@ -1,0 +1,62 @@
+# The beacon indexer in anchored mode with a full-history fallback (spec 10.1):
+# fills the ALL head from a beacon node for what it still has, and a full-history
+# blob source for what it has pruned.
+#
+#   bloar-index beacon -config /etc/bloar/index/backfill-all.yaml
+#
+# This is how history older than a beacon node's blob retention gets archived. It
+# is the same loop as beacon-all.yaml with a second blob source: the block feed
+# still decides what every slot must contain -- the node never prunes blocks -- so
+# a slot whose blobs the node has pruned is served by the fallback and anchored
+# against the block's commitments, never recorded as empty.
+#
+# Run it alongside the live-tailing indexer or in its place; both write the same
+# head, spec 5.1's replay path is idempotent, and synced_to keeps them from
+# fighting.
+
+# Private metrics listener; empty (the default) serves nothing. Adds
+# upstream_read_duration_seconds, upstream_read_bytes_total,
+# index_source_fetch_total and index_block_read_duration_seconds over the shared
+# family (spec 10.1). See beacon-all.yaml.
+metrics_listen: "127.0.0.1:9551"
+
+archive:
+  url: http://127.0.0.1:8550
+  # SYSTEMD form: bloar-index@.service delivers /etc/bloar/token as a credential
+  #, and this path
+  # expands from the environment to the private per-unit copy. MANUAL / CONTAINER
+  # / docker-compose has no credential directory: use a plain readable path, e.g.
+  # `token_file: /etc/bloar/token`. See beacon-all.yaml and docs/operations.md
+  # §3.1.
+  token_file: "${CREDENTIALS_DIRECTORY}/token"
+  head: all
+  # Durable local expectation, cross-checked against the live archive when it
+  # is reachable. This keeps a cold writer from becoming a hard startup
+  # dependency without weakening the put-size safety bound.
+  max_put_blobs: 64
+
+upstream:
+  # The trusted block feed AND the primary blob source: a beacon node. It has
+  # every block (nodes never prune blocks), so it remains the authority on what
+  # each slot must contain however far back the backfill runs; it just no longer
+  # has the older blobs themselves.
+  url: http://127.0.0.1:5052
+  # The block feed, explicit here for clarity though it defaults to `url`.
+  block_url: http://127.0.0.1:5052
+  # This example assumes the beacon node actually retains every blob back to the
+  # configured origin. Retention flags do not reacquire data already pruned.
+  # When rebuilding from an empty store and that condition is false, restore a
+  # reviewed Bloar backup or use mirror mode against an authenticated Bloar
+  # archive that already covers the origin; do not silently substitute a public
+  # third-party byte service.
+
+index:
+  batch_size: 64
+  # Resolving a batch's slots concurrently is what makes a backfill race rather
+  # than trickle. Set it to 1 for the original serial resolution.
+  fetch_concurrency: 6
+  max_put_blobs: 64
+  # Backfill is racing through history, not waiting for the chain, so the
+  # caught-up sleep barely applies -- only at the moment it meets the block
+  # feed's own finality.
+  poll_interval: 12s

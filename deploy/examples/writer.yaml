@@ -1,0 +1,260 @@
+# A mainnet writer: the role of spec 11.1 that runs the mutation engine, accepts
+# ingest from the indexers, and publishes what it has (spec 8).
+#
+# This is the full-retention deployment -- every blob since Dencun, forever. Size
+# it accordingly: see docs/operations.md for the arithmetic, but the short of it
+# is tens of TB and growing with the blob limit.
+
+net: mainnet
+
+beacon:
+  # Mainnet's genesis (spec 1). These are what Nitro reads from
+  # /eth/v1/beacon/genesis and /eth/v1/config/spec to work out which slot to ask
+  # for, so they are not decoration: wrong values here are wrong slots at every
+  # client.
+  genesis_time: 1606824023
+  seconds_per_slot: 12
+  genesis_validators_root: "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
+  genesis_fork_version: "0x00000000"
+  spec_extra:
+    DEPOSIT_CHAIN_ID: 1
+    DEPOSIT_NETWORK_ID: 1
+
+store:
+  path: /var/lib/bloar
+  # An online mark-and-sweep. Its short T0 cut reconciles and snapshots pins;
+  # the long mark/enumeration/sweep then runs alongside writes. It is still an
+  # IO-heavy full-store pass, so daily is generous for a writer, whose garbage
+  # is orphaned roots and abandoned ingest.
+  gc_interval: 24h
+  # Separate, read-only full-byte validation; GC itself need not hash every raw
+  # retained blob to establish reachability.
+  scrub_interval: 168h
+  # The decoded-node cache (spec 6.3). Purely a read-path performance feature;
+  # it holds index nodes, never blobs.
+  node_cache_mb: 512
+
+server:
+  listen: ":8550"
+  # The archive bearer token (spec 7.3). Two delivery paths, kept separate:
+  #
+  #   SYSTEMD (this value): the shipped bloard.service delivers /etc/bloar/token as
+  #   a credential and this path expands from the environment to the private
+  #   per-unit copy, so the source can be 0600 root:root -- the bloar user never
+  #   reads it directly, only systemd does. Only the exact ${CREDENTIALS_DIRECTORY}
+  #   prefix is expanded (not general variable interpolation), and bloard refuses
+  #   to start if that variable is unset rather than reading /token. This is the
+  #   same credential handoff bloar-index@.service needs for its DynamicUser uid
+  #; see docs/operations.md §3.1.
+  #
+  #   MANUAL / CONTAINER / docker-compose: there is no credential directory. Use a
+  #   plain path to a file the running uid can read, e.g.
+  #     auth_token_file: /etc/bloar/token
+  auth_token_file: "${CREDENTIALS_DIRECTORY}/token"
+  max_put_blobs: 64
+  # The most versioned_hashes one public blobs request may name, duplicates
+  # counted. A request naming more is 400 before any blob is looked up. The
+  # default is the protocol ceiling of 128 -- above any fork's blobs per slot --
+  # so a real client never trips it; it exists to refuse the duplicate-query
+  # amplification of the read API. It may be lowered but not
+  # raised above 128. A separate, fixed protocol ceiling (also 128) bounds how
+  # many blobs any stored slot may carry, enforced when refs are applied; that
+  # one does not move when this cap is lowered.
+  max_query_hashes: 128
+  # A process-wide ceiling, in bytes, on the peak live memory all in-flight blob
+  # responses may hold at once. Every blob-carrying response is admitted against
+  # it before it reads anything and holds its reservation until it is written; at
+  # the ceiling, further responses wait rather than allocate. It is a ceiling,
+  # not a reservation -- it costs nothing idle -- and must admit at least one
+  # maximum response (the cap above times the worst-case per-blob weight), or
+  # startup fails. The default is 1 GiB.
+  max_response_bytes_in_flight: 1073741824
+  # One day of slots behind synced_to, after which answers are cached immutably
+  # for a year (spec 7.1). This is the number a CDN in front of this archive
+  # keys off, and the reason it is not zero is that truncate (spec 5.4) exists.
+  immutable_horizon_slots: 7200
+  # Connection-lifetime and concurrency bounds. These are the
+  # shipped defaults, written out here so an operator can see and tune them; the
+  # values below are what the daemon uses if the keys are omitted. They are safe
+  # for a listener exposed directly. A CDN or reverse proxy in front is defense in
+  # depth and where you would raise or lower these to match it -- NOT a
+  # precondition for the listener to be safe.
+  #
+  # read_header_timeout bounds reading request headers. read_timeout is the finite
+  # wall-clock bound on reading a WHOLE request, header and body: it is what closes
+  # a slow or stalled body on every path, including the ones that reject before
+  # reading (a bad token, an unknown head, a malformed frame), where net/http's
+  # body drain would otherwise park a connection. A valid authenticated mutation
+  # extends its own body read to mutation_body_timeout, so a legitimate large
+  # upload is not cut off; that value must exceed read_timeout. write_timeout is
+  # the public blobs response's write budget -- a slow reader of a multi-megabyte
+  # body cannot hold a handler past it. idle_timeout bounds a kept-alive but silent
+  # connection. max_header_bytes caps request headers (64 KiB, far under net/http's
+  # 1 MiB default). max_conns caps concurrently open connections.
+  read_header_timeout: 10s
+  read_timeout: 15s
+  write_timeout: 120s
+  idle_timeout: 60s
+  mutation_body_timeout: 60s
+  max_header_bytes: 65536
+  max_conns: 1024
+  # Weighted admission for public GETs. A metadata request costs 1; a filtered
+  # blobs request costs 1 + number of versioned_hashes (duplicates included);
+  # an unfiltered blobs request conservatively costs 1 + max_query_hashes. The
+  # global bucket is authoritative and every client also has its own bounded,
+  # expiring bucket, so address churn cannot bypass total origin capacity.
+  # Rejection is 429 + integer Retry-After + Cache-Control: no-store.
+  #
+  # These initial defaults admit roughly 8 maximum-cost requests/s from one
+  # client and 32/s process-wide, with bursts of 31 and 127 respectively.
+  # Filtered serial sync is much cheaper. They are provisional until rollout
+  # load evidence exists; tune from the admission metrics, response latency and
+  # target-host capacity rather than treating them as universal constants.
+  public_read_admission:
+    enabled: true
+    global_rate: 4096
+    global_burst: 16384
+    client_rate: 1024
+    client_burst: 4096
+    client_buckets: 4096
+    client_bucket_ttl: 15m
+    # Forwarding headers are ignored by default. To identify the original
+    # client behind a proxy, configure BOTH fields. CIDRs must be canonical
+    # networks (no host bits); only a socket peer in one may supply the header.
+    trusted_proxy_header: ""
+    trusted_proxy_cidrs: []
+  # Prometheus, /healthz and /readyz. Bound to localhost: this is not the public
+  # API, and nothing in front of this box should be able to reach it. Empty
+  # (the default) turns the whole thing off.
+  metrics_listen: "127.0.0.1:9550"
+
+ingest:
+  # How long a blob that was PUT but never referenced stays pinned (spec 9's
+  # window (a)). The default. Lower it only if abandoned puts are costing real
+  # disk, which means an indexer is crashing between its two requests and the
+  # thing to fix is the indexer.
+  staging_ttl: 24h
+  # How many of a batch's blobs to KZG-verify at once (spec 7.2). Zero (the
+  # default) derives a small bound from the core count; 1 is serial. Each blob's
+  # commitment already spreads its own arithmetic across every core, so a few
+  # concurrent verifies fill the machine and more just adds contention. Raise it
+  # only if a measurement shows idle cores while ingest is the bottleneck.
+  verify_concurrency: 0
+
+publish:
+  # Optional logical archive identity for independent writers (spec 8 and
+  # 11.3.1). Generate this ONCE with `openssl rand -hex 32` and copy the same
+  # public value to every writer. Setting it activates signed, revisioned v3.
+  # archive_id: "<64 lowercase hex characters>"
+  # The key every follower verifies documents against (spec 8). Its public half
+  # is what an operator hands out; see docs/operations.md for generating it.
+  signing_key_file: /etc/bloar/ed25519.key
+  ipns: true
+  ipns_republish: 4h
+  # For the split private-writer/public-edge topology, remove the active p2p
+  # block below and configure the edge handoff. The public bloar-edge config
+  # must use the same 2m control.transaction_timeout. The strict
+  # 2m < 2m30s < 3m transaction/client/server ordering makes the edge return a
+  # structured stage result before the writer or HTTP server abandons it.
+  #
+  # edge:
+  #   mode: required
+  #   control_socket: /run/bloar-edge/control.sock
+  #   identity_key_file: /var/lib/bloar/p2p.key
+  #   multiaddrs:
+  #     - /ip4/198.51.100.10/tcp/4005/p2p/<public-edge-peer-id>
+  #   transaction_timeout: 2m
+  #   request_timeout: 2m30s
+
+p2p:
+  listen: ["/ip4/0.0.0.0/tcp/4001"]
+  # Optional stable peers: kept connected, protected from pruning, and also
+  # included alongside the public Amino bootstrappers. Rendezvous provides the
+  # zero-config path; static peers remain a deterministic fast path.
+  peers: []
+  # What the publication document advertises. Set this to the address followers
+  # can actually reach -- the listen address above is 0.0.0.0, which is not one.
+  # The /p2p/<peerid> suffix a follower dials with is appended automatically when
+  # omitted (as here); writing out the full form is accepted too.
+  announce: ["/ip4/198.51.100.10/tcp/4001"]
+  # Defaults to <store.path>/p2p.key, created 0600 on first run. It must be
+  # stable across restarts: it is the IPNS name and the PeerID every follower
+  # has written down.
+  identity_key_file: /var/lib/bloar/p2p.key
+  # public is the normal embedded-swarm mode. private consults only p2p.peers
+  # and is the explicit hermetic/private-deployment setting. Rendezvous uses one
+  # synthetic provider key per (network, head), never one per archive block.
+  dht: { bootstrap: public }
+  rendezvous: { enabled: true }
+  # Relay v2 is an introduction/DCUtR control plane, not a blob fallback. The
+  # service only activates when AutoNAT observes this node as Public; private
+  # nodes use an explicitly configured relay reservation and then hole-punch.
+  relay:
+    service:
+      enabled: true
+      reservation_ttl: 1h
+      max_reservations: 32
+      max_circuits_per_peer: 4
+      buffer_size_bytes: 2048
+      max_reservations_per_ip: 8
+      max_reservations_per_asn: 16
+      circuit_duration: 2m
+      circuit_data_bytes: 131072
+    hole_punching: true
+    # Full direct peer multiaddrs. Empty is valid and leaves AutoRelay off.
+    static_candidates: []
+  # Connection-manager watermarks prune; ResourceManager is the hard admission
+  # boundary. These pinned home-node defaults are provisional until production
+  # rollout measurements replace them; zero selects rather than disables them.
+  connection_manager:
+    low_watermark: 160
+    high_watermark: 192
+    grace_period: 1m
+  resource_manager:
+    memory_bytes: 536870912
+    file_descriptors: 1024
+    connections: 256
+    inbound_connections: 256
+    outbound_connections: 256
+    streams: 4096
+    inbound_streams: 2048
+    outbound_streams: 3072
+    peer_connections: 8
+    peer_inbound_connections: 8
+    peer_outbound_connections: 8
+    peer_streams: 512
+    peer_inbound_streams: 256
+    peer_outbound_streams: 512
+    peer_memory_bytes: 134217728
+    peer_file_descriptors: 16
+  # Serving is default-on for writers and followers. These are Bloar-owned,
+  # explicitly passed Boxo v0.41 work bounds; they are not bandwidth limits.
+  # Set serve: false to keep client fetching while refusing Bitswap serving.
+  bitswap:
+    serve: true
+    max_queued_wants_per_peer: 1024
+    max_outstanding_bytes_per_peer: 1048576
+    send_workers: 8
+    engine_task_workers: 8
+    blockstore_workers: 128
+    max_cid_bytes: 168
+
+heads:
+  all:
+    # Dencun: the first mainnet slot that could carry a blob (spec 1).
+    origin_slot: 8626176
+    # 512 slots per segment. Spec 12's sizing rule: at the mid-2026 BPO
+    # schedule's 21 blobs/slot and ~80 bytes per ref, a full window is ~860 KiB
+    # -- under the ~1.5 MiB worst case. These are immutable for the life of the
+    # head (spec 3.1); changing one means building a new head and rebuilding.
+    seg_bits: 9
+    fanout_bits: 8
+    pin: { mode: full }
+
+  arbitrum-one:
+    origin_slot: 8626176
+    # 8192 slots per segment: a chain head carries far fewer refs per slot than
+    # the ALL head, so a wider window still lands in the size target.
+    seg_bits: 13
+    fanout_bits: 8
+    pin: { mode: full }

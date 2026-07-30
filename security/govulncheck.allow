@@ -1,0 +1,9 @@
+# Reachable advisory IDs accepted temporarily by explicit project policy.
+#
+# GO-2024-3218 describes Kademlia DHT censorship/eclipse behavior and has no
+# fixed upstream version. BlobArchive treats it as an availability threat:
+# DNSLink/IPNS signatures preserve integrity, while independent writers,
+# out-of-band/static peer hints, retained last-good state, and operator
+# monitoring limit the discovery failure. See SECURITY.md. No other reachable
+# advisory is allowed through the release gate.
+GO-2024-3218

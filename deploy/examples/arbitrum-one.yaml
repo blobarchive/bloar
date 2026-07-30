@@ -1,0 +1,88 @@
+# The chain indexer (spec 10.2): fills the arbitrum-one head by scanning its
+# SequencerInbox on L1.
+#
+#   bloar-index chain -config /etc/bloar/index/chain-arbitrum-one.yaml
+#
+# Install as bloar-index@chain-arbitrum-one (see deploy/systemd/bloar-index@.service):
+# the unit derives the subcommand from the instance-name prefix, so a chain head's
+# instance is chain-* even though the head it writes is named arbitrum-one.
+#
+# What it does: scans SequencerBatchDelivered events / inbox txs over finalized
+# L1 blocks, takes the blob hashes out of each type-3 batch tx in tx order, maps
+# the L1 block's timestamp to a beacon slot, and posts the refs. The blobs
+# themselves it does not fetch -- see fetch_blobs below.
+
+# Private metrics listener; empty (the default) serves nothing. Adds
+# upstream_read_duration_seconds and upstream_read_bytes_total over the shared
+# family (spec 10.1), and is populated only when fetch_blobs is true -- a
+# trailing chain indexer reads no blobs from an upstream. See beacon-all.yaml.
+metrics_listen: "127.0.0.1:9551"
+
+beacon:
+  # REQUIRED for this subcommand, and load-bearing: this is what turns an L1
+  # block timestamp into a slot number. A wrong value here does not fail, it
+  # files every row on the wrong slot, consistently enough to look deliberate.
+  genesis_time: 1606824023
+  seconds_per_slot: 12
+
+archive:
+  url: http://127.0.0.1:8550
+  # SYSTEMD form: bloar-index@.service delivers /etc/bloar/token as a credential
+  #, and this path
+  # expands from the environment to the private per-unit copy. MANUAL / CONTAINER
+  # / docker-compose has no credential directory: use a plain readable path, e.g.
+  # `token_file: /etc/bloar/token`. See beacon-all.yaml and docs/operations.md
+  # §3.1.
+  token_file: "${CREDENTIALS_DIRECTORY}/token"
+  head: arbitrum-one
+  # Durable local expectation, cross-checked against the live archive when it
+  # is reachable. A mismatch is fatal; temporary unavailability is not.
+  max_put_blobs: 64
+
+chain:
+  # A finalized-capable L1 execution RPC. It only ever reads finalized blocks
+  # (spec 10.3), so this need not be an archive node.
+  parent_chain_rpc: http://127.0.0.1:8545
+
+  # The head's filter: an ordered list of sources whose selections are unioned
+  # and deduplicated per row in encounter order (spec 10.4). This head is the
+  # shipped default -- a single inbox-events source over Arbitrum One's
+  # SequencerInbox -- so the list has one entry. Were the chain to later post
+  # blobs from a plain EOA instead, you would close this source (give it an
+  # until_block) and append a blob-txs source starting at the next block; the
+  # head stays arbitrum-one across the change, described by two ranges.
+  sources:
+    - type: inbox-events
+      # Arbitrum One's SequencerInbox on Ethereum mainnet.
+      address: "0x1c479675ad559DC151F6Ec7ed3FbF8ceE79582B6"
+      # topic defaults to the pinned SequencerBatchDelivered hash (spec 10.2);
+      # set it only to match a different event.
+      # topic: "0x7394f4a19a13c7b92b5bb71033245305946ef78452f7b4986ac1390b5df4ebd7"
+      from_block: 0
+      # until_block: 21000000   # inclusive; omit for an open-ended source
+
+  # false is the right answer when the ALL head is on the same archive, and it
+  # is the interesting one: this head then stores no blobs of its own at all. It
+  # posts refs naming blob CIDs the beacon indexer has already put, and the two
+  # heads share the blocks (GC keeps anything any live pin reaches). The chain
+  # head becomes a filtered view over the ALL head's blobs, for free.
+  #
+  # The cost is an ordering constraint: this indexer waits until the ALL head's
+  # synced_to has passed the slot it wants to cover, so it trails the beacon
+  # indexer. Set it true (and give upstream.url a beacon node or archive) only
+  # if this archive has no ALL head to lean on.
+  fetch_blobs: false
+  # The head whose coverage gates this one when fetch_blobs is false.
+  all_head: all
+
+index:
+  # L1 blocks per scan. A wider range is fewer RPC round trips and a bigger
+  # eth_getLogs response; 1000 is the default and is polite to a shared RPC.
+  block_range: 1000
+  # blob-txs sources read every block body. Four workers, each issuing batches
+  # of 16 eth_getBlockByNumber calls, are the defaults; inbox-events sources
+  # ignore both settings.
+  block_fetch_concurrency: 4
+  rpc_batch_size: 16
+  max_put_blobs: 64
+  poll_interval: 12s
