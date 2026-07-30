@@ -3,10 +3,10 @@ module github.com/blobarchive/bloar/conformance
 go 1.26.0
 
 require (
+	github.com/blobarchive/bloar v0.0.0-00010101000000-000000000000
 	github.com/ethereum/go-ethereum v1.17.4
 	github.com/ipfs/go-cid v0.6.2
 	github.com/offchainlabs/nitro v0.1.1-0.20260616222001-a61815591931
-	github.com/blobarchive/bloar v0.0.0-00010101000000-000000000000
 )
 
 require (
@@ -145,8 +145,8 @@ require (
 	github.com/prometheus/common v0.67.5 // indirect
 	github.com/prometheus/procfs v0.20.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/quic-go/quic-go v0.59.1 // indirect
-	github.com/quic-go/webtransport-go v0.10.0 // indirect
+	github.com/quic-go/quic-go v0.60.0 // indirect
+	github.com/quic-go/webtransport-go v0.11.1 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/shirou/gopsutil v3.21.11+incompatible // indirect
