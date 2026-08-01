@@ -19,10 +19,12 @@ different role with different upstream requirements.
 From this directory:
 
 ```sh
-# Download bloar-v0.X.Y-image.env from the verified tagged Release, inspect it,
-# then load its immutable BLOAR_IMAGE_DIGEST value.
+BLOAR_VERSION=v0.1.0
+curl -fsSL -O \
+  https://github.com/blobarchive/bloar/releases/download/$BLOAR_VERSION/bloar-$BLOAR_VERSION-image.env
+# Inspect it, then load its immutable BLOAR_IMAGE_DIGEST value.
 set -a
-. ./bloar-v0.X.Y-image.env
+. ./bloar-$BLOAR_VERSION-image.env
 set +a
 sudo install -d -m 0750 -o 65532 -g 65532 data
 sudo install -m 0400 -o 65532 -g 65532 /dev/null token
