@@ -86,12 +86,16 @@ mounts remain enabled.
 
 ## Verify as an operator
 
-After downloading `bloar-v0.X.Y-image.env` from the GitHub Release, inspect it
-and use the immutable reference:
+Download the release environment file, inspect it, and use the immutable
+references:
 
 ```sh
+BLOAR_VERSION=v0.1.0
+curl -fsSL -O \
+  https://github.com/blobarchive/bloar/releases/download/$BLOAR_VERSION/bloar-$BLOAR_VERSION-image.env
+# Inspect it, then load its immutable BLOAR_IMAGE_DIGEST value.
 set -a
-. ./bloar-v0.X.Y-image.env
+. ./bloar-$BLOAR_VERSION-image.env
 set +a
 
 for digest in "$BLOAR_IMAGE_DIGEST" "$BLOAR_EDGE_IMAGE_DIGEST"; do
