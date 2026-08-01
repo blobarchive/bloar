@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # Reads the toolchain line from go.mod, so CI and local builds cannot drift.
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: make build
+
+      - name: Test
+        run: make test
+
+      - name: Lint
+        run: make lint
+
+  image:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # make docker passes the checked-out revision to the image, while the
+      # Dockerfile independently requires the same revision in Go build info.
+      - name: Build provenance-bound image
+        run: make docker IMAGE=bloar:ci
+
+      - name: Verify OCI provenance labels
+        env:
+          IMAGE: bloar:ci
+          SOURCE_URL: https://github.com/blobarchive/bloar
+        run: |
+          revision="$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
+          source="$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.source" }}')"
+          created="$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.created" }}')"
+          test "$revision" = "$GITHUB_SHA"
+          test "$source" = "$SOURCE_URL"
+          test -n "$created"
+
+  # Spec 13.1: nitro's own beacon client against an in-process bloard. This is
+  # its own job because conformance/ is its own module and pulls nitro's
+  # dependency graph, which is large enough that folding it into the job above
+  # would slow every run down for a suite the root module does not depend on.
+  conformance:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # Same pin as the job above: the root go.mod is the one toolchain source.
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          # setup-go caches modules by default; nitro's graph is heavy enough
+          # that the key has to cover conformance/go.sum too, or every run
+          # re-downloads it.
+          cache-dependency-path: |
+            go.sum
+            conformance/go.sum
+
+      - name: Conformance
+        run: make conformance
+
+  security:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            conformance/go.sum
+
+      - name: Supply-chain policy
+        run: make supply-chain-check
+
+      - name: Pinned dependency graphs
+        run: make dependency-check
+
+      - name: Reachable vulnerability scan
+        run: make vulncheck
+
+      - name: P2P smoke tests
+        run: make p2p-smoke

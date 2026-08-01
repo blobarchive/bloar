@@ -1,0 +1,8 @@
+# The production build uses a generated context containing only tracked Go
+# source plus go.mod/go.sum, and supplies minimal Git metadata separately as a
+# BuildKit secret. Deny the ordinary repository context so direct invocations
+# cannot send .git metadata, credentials, local secrets, evidence, state, or
+# other untracked operator files to Docker.
+**
+!deploy/
+!deploy/Dockerfile

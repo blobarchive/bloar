@@ -1,0 +1,188 @@
+# A mainnet follower: a node that replicates a writer's head rather than writing
+# one (spec 11.3), and serves it to Nitro exactly as the writer does.
+#
+# This is the deployment most people want. It holds a 30-day window of one
+# chain's blobs -- a few hundred GB rather than the writer's tens of TB -- and it
+# still answers "was there a blob at this slot" for all of history, because every
+# pin policy retains the whole index (spec 9).
+#
+# It writes no heads at all: there is no `heads:` block, which is what makes this
+# a follower and not a writer that happens to also follow.
+
+net: mainnet
+
+beacon:
+  genesis_time: 1606824023
+  seconds_per_slot: 12
+  genesis_validators_root: "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
+  genesis_fork_version: "0x00000000"
+
+store:
+  path: /var/lib/bloar
+  # More often than a writer's. A follower's window slides: every day, a day of
+  # sealed segments falls out of the retention range and their blobs become
+  # garbage. GC is the only thing that reclaims them, so its period is also the
+  # amount of expired-but-not-yet-deleted blobs the disk carries. The collector
+  # holds publication only for its short T0 cut; mark and sweep run online.
+  gc_interval: 6h
+  # Separate, read-only full-byte validation. GC validates reachability but does
+  # not hash every retained raw blob.
+  scrub_interval: 168h
+  node_cache_mb: 256
+
+server:
+  listen: ":8550"
+  # Required even though this node writes nothing: the endpoints it guards are
+  # refused for this node's followed heads (403, spec 11.1) rather than absent,
+  # and an empty token would make every unauthenticated request an admin.
+  #
+  # SYSTEMD form: bloard.service delivers /etc/bloar/token as a credential and this
+  # path expands from the environment to the private per-unit copy, so the source
+  # can be 0600 root:root. MANUAL / CONTAINER / docker-compose has no credential
+  # directory: use a plain readable path, e.g. `auth_token_file: /etc/bloar/token`.
+  # See writer.yaml and docs/operations.md §3.1.
+  auth_token_file: "${CREDENTIALS_DIRECTORY}/token"
+  # The read-path safety bounds of the request-safety invariant apply to a follower too: it
+  # serves the same public blobs endpoint Nitro syncs through. Defaults shown;
+  # see writer.yaml for what each one bounds. max_query_hashes may be lowered but
+  # not raised above the protocol ceiling of 128.
+  max_query_hashes: 128
+  max_response_bytes_in_flight: 1073741824
+  immutable_horizon_slots: 7200
+  # Default-on weighted admission for public GETs. Costs are 1 for metadata,
+  # 1 + requested versioned_hashes for filtered blob reads, and 1 +
+  # max_query_hashes for unfiltered reads. These provisional defaults admit a
+  # representative serial sync while bounding the origin globally and per
+  # client; 429 responses carry Retry-After and are safe to retry.
+  public_read_admission:
+    enabled: true
+    global_rate: 4096
+    global_burst: 16384
+    client_rate: 1024
+    client_burst: 4096
+    client_buckets: 4096
+    client_bucket_ttl: 15m
+    trusted_proxy_header: ""
+    trusted_proxy_cidrs: []
+  metrics_listen: "127.0.0.1:9550"
+
+p2p:
+  listen: ["/ip4/0.0.0.0/tcp/4001"]
+  # Optional stable peers. Public Amino rendezvous discovers additional peers,
+  # but the DHT is never handed to Bitswap as generic per-block provider
+  # routing; only connected static/rendezvous/document peers serve block wants.
+  peers:
+    # Syntactically valid example PeerID; replace the whole address.
+    - "/ip4/198.51.100.10/tcp/4001/p2p/12D3KooWA6Wm6iNn2LcAwPHnLhSCE6dSyRPmFRDyPvL9dcJZuJfF"
+  identity_key_file: /var/lib/bloar/p2p.key
+  dht: { bootstrap: public }
+  rendezvous: { enabled: true }
+  # Relay circuits introduce private nodes for DCUtR. Bitswap deliberately does
+  # not use limited relay connections, and the 128-KiB circuit cap cannot carry
+  # one encoded blob. Supply globally reachable or DNS direct peer addresses
+  # here only when this node needs a known relay; empty keeps AutoRelay off.
+  relay:
+    service:
+      enabled: true
+      reservation_ttl: 1h
+      max_reservations: 32
+      max_circuits_per_peer: 4
+      buffer_size_bytes: 2048
+      max_reservations_per_ip: 8
+      max_reservations_per_asn: 16
+      circuit_duration: 2m
+      circuit_data_bytes: 131072
+    hole_punching: true
+    static_candidates: []
+    # static_candidates:
+    #   - /dns4/relay.example.org/tcp/4001/p2p/12D3KooW...
+  # Watermarks prune ordinary connections back toward low after grace; they are
+  # not hard caps. Configured static peers are protected from pruning and remain
+  # in addition to low. The resource manager below is the hard boundary.
+  connection_manager:
+    low_watermark: 160
+    high_watermark: 192
+    grace_period: 1m
+  resource_manager:
+    memory_bytes: 536870912
+    file_descriptors: 1024
+    connections: 256
+    inbound_connections: 256
+    outbound_connections: 256
+    streams: 4096
+    inbound_streams: 2048
+    outbound_streams: 3072
+    peer_connections: 8
+    peer_inbound_connections: 8
+    peer_outbound_connections: 8
+    peer_streams: 512
+    peer_inbound_streams: 256
+    peer_outbound_streams: 512
+    peer_memory_bytes: 134217728
+    peer_file_descriptors: 16
+  # Default-on serving makes a follower contribute every block it retained.
+  # Set serve: false to opt out without disabling this node's client fetches.
+  # The remaining values pin Boxo's queue/concurrency/working-set defaults so a
+  # dependency update cannot silently change the node's resource posture.
+  bitswap:
+    serve: true
+    max_queued_wants_per_peer: 1024
+    max_outstanding_bytes_per_peer: 1048576
+    send_workers: 8
+    engine_task_workers: 8
+    blockstore_workers: 128
+    max_cid_bytes: 168
+
+follow:
+  # HTTPS plus one name authority. DNSLink is a stable human name that selects
+  # exactly one /ipns/<name>; direct `ipns:` is the mutually exclusive pinned-
+  # name alternative. Whichever configured channel yields the freshest
+  # authenticated document wins.
+  url: https://archive.example.org
+  dnslink: swarm.example.org
+  # ipns: k51qzi5uqu5dexampleipnsnamefromthewriterslogs
+  # Optional only with DNSLink: setting the writer's hex ed25519 publication
+  # key pins the signer (stronger than ordinary non-DNSSEC resolution) while
+  # still allowing IPNS-name rotation. Omit it to let an admitted DNSLink ->
+  # signed IPNS -> exact-CID document chain bootstrap and rotate the signer.
+  # pubkey: "0000000000000000000000000000000000000000000000000000000000000000"
+  # Public live views are near-live rather than per-slot streams. Combined with
+  # batched writer publication, this default normally yields about 1-2 minutes
+  # of steady-state lag; retries can extend it and a frozen publication still
+  # serves valid stale state, so monitor accepted-generation age.
+  poll_interval: 60s
+  # Bounds one on-demand block fetch on the read path (spec 11.4). A read that
+  # cannot be served in this long answers 503 + Retry-After: 12.
+  fetch_timeout: 5s
+  # cid (the default) checks that fetched blocks hash to the CIDs that named
+  # them, which is what content addressing already guarantees end-to-end. full
+  # additionally re-derives every blob's KZG commitment and checks it against
+  # the vh the index claims -- that is a check on the writer's honesty rather
+  # than on the transport. Serving still verifies each returned blob. Background
+  # sync persists successful proofs for immutable sealed Segment CIDs; the
+  # changing open Segment's proof remains memory-only.
+  verify: cid
+  heads:
+    arbitrum-one:
+      # REQUIRED, and there is deliberately no default: the writer's `full`
+      # would silently retain the entire archive on a node that asked to
+      # replicate one chain.
+      pin: { mode: window, duration: 720h }
+    # To add an exact-hash-only optimistic tip without retaining global `all`
+    # history, select the writer's bounded mutable head too. Its `all` handoff
+    # line is authenticated metadata only on this follower: it gets no
+    # independent selected checkpoint and is not fetched, pinned, served, or
+    # republished. Its exact line is nested in the mutable restart checkpoint.
+    # unfinalized:
+    #   kind: unfinalized-mutable
+    #   handoff_head: all
+    #   max_window_slots: 64
+    #   pin: { mode: full }
+
+# Pair the selected chain archive with that bounded global tip. Finalized slots
+# remain enumerable; provisional requests must name exact versioned_hashes.
+# live_heads:
+#   arbitrum-one-live:
+#     finalized_head: arbitrum-one
+#     unfinalized_head: unfinalized
+#     require_versioned_hashes: true

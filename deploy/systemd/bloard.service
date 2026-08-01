@@ -1,0 +1,106 @@
+# bloard: the bloar archive daemon (spec 11.1's writer or follower role).
+#
+#   install -m0755 bloard /usr/local/bin/bloard
+#   install -m0644 bloard.service /etc/systemd/system/bloard.service
+#   systemctl daemon-reload && systemctl enable --now bloard
+#
+# See docs/operations.md for the store layout, the keys this unit expects, and
+# the backup story.
+
+[Unit]
+Description=bloar archive daemon
+Documentation=https://github.com/blobarchive/bloar
+# The store is the whole daemon. If it is on its own filesystem -- which
+# docs/operations.md recommends, because the backup story is a ZFS dataset --
+# starting before it is mounted would create an empty store beside the real one
+# and resume a head from nothing.
+RequiresMountsFor=/var/lib/bloar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/bloard run -config /etc/bloar/bloard.yaml
+
+# The auth token (spec 7.3) is delivered as a systemd credential, not read from
+# its source path by the daemon. systemd (as root) reads /etc/bloar/token once at
+# start and drops a private 0400 copy in this unit's $CREDENTIALS_DIRECTORY; the
+# config's server.auth_token_file is ${CREDENTIALS_DIRECTORY}/token, which the
+# daemon expands from the environment (docs/operations.md §3.1, and the same
+# handoff bloar-index@.service needs for its DynamicUser -- the credential-handoff invariant).
+#
+# The consequence is that the source can be, and should be, 0600 root:root: the
+# bloar user never reads it directly, only systemd does, so the token is not at
+# rest under an account a daemon compromise would already hold. Change the source
+# path here if it is not /etc/bloar/token; the config keeps saying
+# ${CREDENTIALS_DIRECTORY}/token either way.
+LoadCredential=token:/etc/bloar/token
+
+# A dedicated user, not DynamicUser. DynamicUser is the better default for most
+# daemons, but it allocates a fresh uid on every start and chowns the state
+# directory to match; bloar's store is millions of flatfs block files, and a
+# recursive chown of them at every boot is minutes of IO for nothing. The uid
+# also has to be stable for the ZFS snapshots of docs/operations.md to restore
+# onto a running system.
+#
+#   useradd --system --home-dir /var/lib/bloar --shell /usr/sbin/nologin bloar
+User=bloar
+Group=bloar
+
+# Signals and restarts.
+#
+# SIGTERM is what the daemon drains on (its own 15s HTTP grace, then the store's
+# Close). TimeoutStopSec is comfortably past that: killing it mid-shutdown
+# leaves Pebble's lock file behind, which the next start trips over.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=5s
+
+# Hardening. The daemon reads a config and two keys, writes one directory, and
+# talks to the network; everything below is the difference between that and what
+# a process can do by default.
+ProtectSystem=strict
+ProtectHome=true
+# The one writable path. ProtectSystem=strict makes everything else read-only,
+# so this is the whole write surface: the flatfs blockstore, the Pebble KV, and
+# the p2p identity key the daemon creates on first run (spec 12's default
+# p2p.identity_key_file is <store.path>/p2p.key).
+ReadWritePaths=/var/lib/bloar
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# AF_INET/AF_INET6 for HTTP and libp2p; AF_UNIX because the Go runtime and
+# resolver use it. AF_NETLINK is what libp2p's address discovery reads local
+# interfaces through -- drop it and a host with p2p.listen finds no addresses to
+# announce.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# The store is millions of small files and Pebble wants its own; the default
+# 1024 is not close.
+LimitNOFILE=65536
+
+# Logs go to the journal, which is where the daemon's slog output belongs.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bloard
+
+[Install]
+WantedBy=multi-user.target

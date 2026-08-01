@@ -1,0 +1,109 @@
+# The beacon indexer (spec 10.1): fills the ALL head from a beacon node, in
+# anchored mode.
+#
+#   bloar-index beacon -config /etc/bloar/index/beacon-all.yaml
+#
+# Install as bloar-index@beacon-all (see deploy/systemd/bloar-index@.service).
+#
+# It is stateless: its whole progress state is the archive's own synced_to, read
+# back over HTTP (spec 10). Restart it, move it, run it on another host -- it
+# picks up where the archive says it left off. The one thing it keeps in memory,
+# anchored mode's parent-root continuity anchor, is re-seeded from synced_to on
+# every start.
+
+# Serve /metrics, /healthz and /readyz on a private address; empty is the
+# default and serves nothing. This is a top-level key, not a server block: the
+# indexer runs no API of its own. Adds upstream_read_duration_seconds,
+# upstream_read_bytes_total, index_source_fetch_total and
+# index_block_read_duration_seconds over the shared daemon family (spec 10.1).
+# Use a port distinct from the archive's own metrics_listen when they share a
+# host.
+metrics_listen: "127.0.0.1:9551"
+
+archive:
+  url: http://127.0.0.1:8550
+  # The archive bearer token (spec 7.3). Two delivery paths, kept separate:
+  #
+  #   SYSTEMD (this value): the shipped bloar-index@.service runs DynamicUser=yes,
+  #   whose transient uid cannot read a 0600 token, so the unit delivers
+  #   /etc/bloar/token as a credential and this path expands from the environment
+  #   to the private per-unit copy. This is the fix for the credential-handoff invariant; see
+  #   docs/operations.md §3.1. Only the exact ${CREDENTIALS_DIRECTORY} prefix is
+  #   expanded -- it is not general variable interpolation -- and the indexer
+  #   refuses to start if that variable is unset, rather than reading /token.
+  #
+  #   MANUAL / CONTAINER / docker-compose: there is no credential directory. Use a
+  #   plain path to a file the running uid can read, e.g.
+  #     token_file: /etc/bloar/token
+  token_file: "${CREDENTIALS_DIRECTORY}/token"
+  head: all
+  # Durable local expectation, cross-checked against the live archive when it
+  # is reachable. A mismatch is fatal; temporary unavailability is not.
+  max_put_blobs: 64
+
+upstream:
+  # Anchored mode (head unset): existence and absence come from the trusted
+  # block feed below, and this URL is just the blob byte source -- untrusted,
+  # anchored per blob against the block's commitments. A slot the node has
+  # pruned is skipped, not recorded as empty, so this is safe even past the
+  # node's blob retention window (~18 days on mainnet) as long as the block feed
+  # still has the blocks (a node never prunes blocks).
+  url: http://127.0.0.1:5052
+  # The trusted block feed: the beacon node's block API, the sole authority on
+  # which slots carried blocks and what blobs each must hold. It defaults to
+  # `url`, which is the common case -- one beacon node is both the block feed and
+  # the blob source. Point it elsewhere only to split the roles (e.g. a
+  # full-archive node for blocks and a nearer one for blobs).
+  # block_url: http://127.0.0.1:5052
+  #
+  # Leave `head` unset for anchored mode. Setting it is mirror mode (deterministic
+  # replication, spec 11.5): the upstream is another bloar archive whose coverage
+  # decisions this indexer copies, with no block feed and no fallback -- it inherits
+  # the source's completeness rather than proving it. See mirror.yaml for that mode,
+  # backfill-all.yaml for the anchored fallback, and the index/beacon package
+  # comment for the two trust models.
+  #
+  # Optional second blob source, tried when the primary above cannot serve a
+  # slot's block-attested blobs (it has pruned them, or does not have them). Both
+  # sources are untrusted: a source is accepted only when its bytes commit to the
+  # block-derived versioned hashes, so a full-history fallback needs no
+  # corroboration and absence is never recorded from either. Give it a head only
+  # when the fallback is itself a bloar archive serving as a byte source.
+  # fallback_url: https://paid-provider.example.org
+  # fallback_head: all
+  #
+  # Every source -- this beacon node primary, a Bloar archive, or a
+  # beacon-shaped fallback -- is asked for the whole slot. The answer is
+  # anchored positionally against the block's commitments.
+  #
+  # continuity_checkpoint: a trusted (slot, root) the parent-root continuity walk
+  # stops at (spec 10.1). NOT needed here -- mainnet's origin is millions of slots
+  # above genesis. It is only for a young or dev network whose origin sits within
+  # ~1024 slots of slot 0: there the seed walk can reach slot 0 without a present
+  # header (the feed is still backfilling), and with no anchor it WAITS
+  # indefinitely rather than guess. A checkpoint gives it a trusted floor. The slot
+  # MUST be strictly before the current resume start -- synced_to + 1, or origin_slot
+  # when the archive has no coverage yet -- so it never itself advances coverage, and
+  # the root is a 0x-prefixed 32-byte block root you have verified out of band. It is
+  # consulted only when the seed walk reaches its slot (a present header above it
+  # anchors instead); if the feed's header there is then present and its root
+  # disagrees with this one, the indexer refuses to run. Raising the head's
+  # origin_slot past the unbackfilled region is the alternative. See the runbook
+  # section "Anchored indexer near genesis" in docs/operations.md.
+  # continuity_checkpoint:
+  #   slot: 8000
+  #   root: "0x0000000000000000000000000000000000000000000000000000000000000000"
+
+index:
+  # Slots per refs batch (B in spec 10.1's loop).
+  batch_size: 64
+  # How many of a batch's slots to resolve from the upstream at once. Each slot
+  # is an independent header/commitments/source resolution, and doing them one at
+  # a time is most of the loop's wall-clock, so this is the throughput knob. Set
+  # it to 1 for the original serial resolution.
+  fetch_concurrency: 6
+  # Must not exceed the archive's server.max_put_blobs (spec 7.2, default 64).
+  max_put_blobs: 64
+  # How long to sleep once caught up. One slot: there is no point asking for a
+  # finalized slot more often than the chain produces one.
+  poll_interval: 12s

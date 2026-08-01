@@ -1,0 +1,39 @@
+[Unit]
+Description=Bloar standalone Kubo archive replica controller
+Documentation=https://github.com/blobarchive/bloar/blob/main/docs/kubo-replica.md
+After=network-online.target ipfs.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bloar
+Group=bloar
+StateDirectory=bloar-kubo-replica
+StateDirectoryMode=0700
+LoadCredential=kubo-api-token:/etc/bloar/kubo-api-token
+ExecStart=/usr/local/bin/bloar-kubo-replica -config /etc/bloar/kubo-replica.yaml
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=30s
+
+# The controller needs only outbound HTTPS/DNS and the Kubo RPC socket. It does
+# not read the Kubo repo, run a libp2p host, or own archive block files.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

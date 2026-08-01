@@ -1,0 +1,20 @@
+follow: ethereum-mainnet-arb1-live-a
+
+store:
+  path: /var/lib/bloar
+  gc_interval: 6h
+  scrub_interval: 168h
+  node_cache_mb: 256
+
+server:
+  listen: 0.0.0.0:8550
+  auth_token_file: /run/secrets/bloar_token
+  metrics_listen: 0.0.0.0:9550
+
+p2p:
+  listen:
+    - /ip4/0.0.0.0/tcp/4001
+  identity_key_file: /var/lib/bloar/p2p.key
+  dht: {bootstrap: public}
+  rendezvous: {enabled: true}
+  bitswap: {serve: true}

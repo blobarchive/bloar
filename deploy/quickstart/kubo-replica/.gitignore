@@ -1,0 +1,4 @@
+/.kubo-api-address.before
+/.kubo-api-authorizations.before.json
+/kubo-api-token
+/state/
