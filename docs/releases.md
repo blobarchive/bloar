@@ -60,7 +60,7 @@ Before `latest` or a GitHub Release can move, the workflow checks:
 - stable, newest-on-the-v0-line tag syntax; annotated verified tag signature;
   exact tag target; protected-main ancestry;
 - build, tests, lint, Nitro conformance, P2P smoke tests, both module graphs'
-  exact quic-go v0.59.1 pin, and reachable `govulncheck`;
+  exact quic-go v0.60.0 pin, and reachable `govulncheck`;
 - a generated Docker context containing only tracked Go/module inputs plus a
   clean one-commit tree-only Git snapshot secret, with checkout credentials
   disabled and layer-cache reuse forbidden so this release must reevaluate the

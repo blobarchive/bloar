@@ -41,9 +41,9 @@ conformance:
 	cd conformance && $(GO) test ./...
 
 dependency-check:
-	@test "$$($(GO) list -m -f '{{.Version}}' github.com/quic-go/quic-go)" = "v0.59.1"
+	@test "$$($(GO) list -m -f '{{.Version}}' github.com/quic-go/quic-go)" = "v0.60.0"
 	@cd conformance && \
-		test "$$($(GO) list -m -f '{{.Version}}' github.com/quic-go/quic-go)" = "v0.59.1"
+		test "$$($(GO) list -m -f '{{.Version}}' github.com/quic-go/quic-go)" = "v0.60.0"
 
 vulncheck:
 	./scripts/govulncheck-gate.sh $(GOVULNCHECK_VERSION)
