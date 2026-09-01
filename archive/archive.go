@@ -79,6 +79,34 @@ type Info struct {
 	DirDepth uint64
 }
 
+// SegmentState is the bounded metric dimension for a writer-produced Segment.
+// An open sample is the current rewrite target; a sealed sample is the same
+// immutable block when its window is linked into the directory.
+type SegmentState string
+
+const (
+	SegmentOpen   SegmentState = "open"
+	SegmentSealed SegmentState = "sealed"
+)
+
+// SegmentSample records the exact canonical block size and logical density of
+// one Segment without exposing its CID, slot or window ordinal as a metric
+// dimension.
+type SegmentSample struct {
+	State        SegmentState
+	EncodedBytes int
+	Rows         int
+	Refs         int
+}
+
+// IndexApplyStats are the exact index DAG bytes encoded by one successful
+// ApplyRefs call and the Segment samples produced along the way. Blob payload
+// bytes are not included.
+type IndexApplyStats struct {
+	EncodedBytes uint64
+	Segments     []SegmentSample
+}
+
 // state is one immutable version of a head. It is published by atomic swap and
 // never mutated after that, so a reader that has loaded it may use it for as
 // long as it likes.
@@ -112,6 +140,14 @@ type Head struct {
 	mu sync.Mutex
 	// cur is the published state. Readers load it; mutators store it last.
 	cur atomic.Pointer[state]
+
+	// The fields below are mutation-local scratch. Head.mu serializes their use.
+	// Codec wrappers add the exact bytes from their one existing encode; they do
+	// not perform a second measurement encode.
+	applyStats          *IndexApplyStats
+	lastApplyStats      IndexApplyStats
+	segmentEncodeState  SegmentState
+	segmentEncodedBytes int
 }
 
 func newHead(cfg Config) (*Head, error) {
@@ -124,13 +160,65 @@ func newHead(cfg Config) (*Head, error) {
 	if cfg.StructureCache == nil {
 		cfg.StructureCache = NewStructureCache()
 	}
-	return &Head{
-		cfg:       cfg,
-		segs:      core.NewNodeStore(cfg.Blocks, core.Codec[schema.Segment]{Encode: schema.EncodeSegment, Decode: schema.DecodeSegment}, cfg.Cache),
-		dirs:      core.NewNodeStore(cfg.Blocks, core.Codec[schema.DirNode]{Encode: schema.EncodeDirNode, Decode: schema.DecodeDirNode}, cfg.Cache),
-		head:      core.NewNodeStore(cfg.Blocks, core.Codec[schema.Head]{Encode: schema.EncodeHead, Decode: schema.DecodeHead}, cfg.Cache),
-		structure: cfg.StructureCache,
-	}, nil
+	h := &Head{cfg: cfg, structure: cfg.StructureCache}
+	h.segs = core.NewNodeStore(cfg.Blocks, core.Codec[schema.Segment]{Encode: h.encodeSegment, Decode: schema.DecodeSegment}, cfg.Cache)
+	h.dirs = core.NewNodeStore(cfg.Blocks, core.Codec[schema.DirNode]{Encode: h.encodeDirNode, Decode: schema.DecodeDirNode}, cfg.Cache)
+	h.head = core.NewNodeStore(cfg.Blocks, core.Codec[schema.Head]{Encode: h.encodeHead, Decode: schema.DecodeHead}, cfg.Cache)
+	return h, nil
+}
+
+func (h *Head) encodeSegment(segment *schema.Segment) ([]byte, cid.Cid, error) {
+	data, id, err := schema.EncodeSegment(segment)
+	if err != nil {
+		return nil, cid.Undef, err
+	}
+	h.segmentEncodedBytes = len(data)
+	refs := 0
+	for _, row := range segment.Rows {
+		refs += len(row.Entries)
+	}
+	if err := h.admitEncodedIndex(IndexNodeSegment, len(data), len(segment.Rows), refs); err != nil {
+		return nil, cid.Undef, err
+	}
+	return data, id, nil
+}
+
+func (h *Head) encodeDirNode(node *schema.DirNode) ([]byte, cid.Cid, error) {
+	data, id, err := schema.EncodeDirNode(node)
+	if err != nil {
+		return nil, cid.Undef, err
+	}
+	if err := h.admitEncodedIndex(IndexNodeDir, len(data), 0, 0); err != nil {
+		return nil, cid.Undef, err
+	}
+	return data, id, nil
+}
+
+func (h *Head) encodeHead(head *schema.Head) ([]byte, cid.Cid, error) {
+	data, id, err := schema.EncodeHead(head)
+	if err != nil {
+		return nil, cid.Undef, err
+	}
+	if err := h.admitEncodedIndex(IndexNodeHead, len(data), 0, 0); err != nil {
+		return nil, cid.Undef, err
+	}
+	return data, id, nil
+}
+
+// admitEncodedIndex is the writer half of the per-index-node admission
+// boundary. It runs after the canonical encoder has produced the exact bytes
+// and before NodeStore can hand them to the blockstore.
+func (h *Head) admitEncodedIndex(kind IndexNodeKind, encodedBytes, rows, refs int) error {
+	if encodedBytes > MaxIndexNodeBytes {
+		return &IndexNodeTooLargeError{
+			Kind: kind, EncodedBytes: encodedBytes, LimitBytes: MaxIndexNodeBytes,
+			State: h.segmentEncodeState, Rows: rows, Refs: refs,
+		}
+	}
+	if h.applyStats != nil {
+		h.applyStats.EncodedBytes += uint64(encodedBytes)
+	}
+	return nil
 }
 
 // New creates an empty head with the given parameters, writes its Head block,

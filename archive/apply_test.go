@@ -84,13 +84,37 @@ func TestSealAtWindowBoundary(t *testing.T) {
 	hs := newHarness(t, testParams())
 
 	// Window 5 is slots 40..47.
-	hs.apply([]archive.RefRow{hs.row(41, 410), hs.row(47, 470)}, 47)
+	res := hs.apply([]archive.RefRow{hs.row(41, 410), hs.row(47, 470)}, 47)
 
 	if got := hs.h.Info().DirDepth; got != 1 {
 		t.Errorf("dir_depth = %d after one seal, want 1", got)
 	}
 	wantBlobs(t, hs.lookup(41), "sealed slot 41", 410)
 	wantBlobs(t, hs.lookup(47), "sealed slot 47", 470)
+	enumeration, err := hs.h.Enumerate(hs.ctx)
+	if err != nil {
+		t.Fatalf("Enumerate after seal: %v", err)
+	}
+	if len(enumeration.Sealed) != 1 || len(res.Index.Segments) != 2 {
+		t.Fatalf("sealed blocks/samples = %d/%d, want 1 block and sealed+open samples", len(enumeration.Sealed), len(res.Index.Segments))
+	}
+	sealedBlock, err := hs.bs.Get(hs.ctx, enumeration.Sealed[0].CID)
+	if err != nil {
+		t.Fatalf("reading sealed Segment: %v", err)
+	}
+	openBlock, err := hs.bs.Get(hs.ctx, enumeration.Open)
+	if err != nil {
+		t.Fatalf("reading open Segment: %v", err)
+	}
+	sealed, open := res.Index.Segments[0], res.Index.Segments[1]
+	if sealed.State != archive.SegmentSealed || sealed.EncodedBytes != len(sealedBlock.RawData()) ||
+		sealed.Rows != 2 || sealed.Refs != 2 {
+		t.Errorf("sealed sample = %#v, stored canonical bytes = %d", sealed, len(sealedBlock.RawData()))
+	}
+	if open.State != archive.SegmentOpen || open.EncodedBytes != len(openBlock.RawData()) ||
+		open.Rows != 0 || open.Refs != 0 {
+		t.Errorf("open sample = %#v, stored canonical bytes = %d", open, len(openBlock.RawData()))
+	}
 
 	// The next batch lands in the freshly opened window 6.
 	hs.apply([]archive.RefRow{hs.row(48, 480)}, 48)
@@ -107,6 +131,34 @@ func TestSealPartialWindowStaysOpen(t *testing.T) {
 		t.Errorf("dir_depth = %d with no window fully covered, want 0", got)
 	}
 	wantBlobs(t, hs.lookup(41), "open slot 41", 410)
+}
+
+func TestSealReusesCommittedOpenBlockAndMeasurement(t *testing.T) {
+	hs := newHarness(t, testParams())
+	openApply := hs.apply([]archive.RefRow{hs.row(41, 410)}, 46)
+	before, err := hs.h.Enumerate(hs.ctx)
+	if err != nil {
+		t.Fatalf("Enumerate before seal: %v", err)
+	}
+	if len(openApply.Index.Segments) != 1 {
+		t.Fatalf("open apply samples = %d, want 1", len(openApply.Index.Segments))
+	}
+
+	sealApply := hs.apply(nil, 47)
+	after, err := hs.h.Enumerate(hs.ctx)
+	if err != nil {
+		t.Fatalf("Enumerate after seal: %v", err)
+	}
+	if len(after.Sealed) != 1 || !after.Sealed[0].CID.Equals(before.Open) {
+		t.Fatalf("sealed Segment = %v, want prior open CID %s", after.Sealed, before.Open)
+	}
+	if len(sealApply.Index.Segments) != 2 {
+		t.Fatalf("seal apply samples = %d, want sealed+open", len(sealApply.Index.Segments))
+	}
+	if got, want := sealApply.Index.Segments[0], openApply.Index.Segments[0]; got.State != archive.SegmentSealed ||
+		got.EncodedBytes != want.EncodedBytes || got.Rows != want.Rows || got.Refs != want.Refs {
+		t.Fatalf("sealed sample %#v does not preserve prior open measurement %#v", got, want)
+	}
 }
 
 // TestEmptyWindowSealsToNull: a window with no rows becomes a null directory
@@ -128,6 +180,35 @@ func TestEmptyWindowSealsToNull(t *testing.T) {
 	// The null entry is a fact, not an absence of one: it holds index 1 so that
 	// window 7 is still addressable at index 2.
 	wantStatus(t, hs.lookupVHs(50, 500), archive.StatusAbsent, "filtered lookup in the empty window")
+}
+
+func TestLatestSealedSegmentSampleSkipsLongNullRun(t *testing.T) {
+	hs := newHarness(t, testParams())
+	const sealedWindows = 40
+	hs.apply([]archive.RefRow{hs.row(testOrigin+1, 410)}, testOrigin+sealedWindows*(1<<testSegBits)-1)
+
+	sample, found, err := hs.h.LatestSealedSegmentSample(hs.ctx)
+	if err != nil {
+		t.Fatalf("LatestSealedSegmentSample: %v", err)
+	}
+	if !found {
+		t.Fatal("directory-aware reverse search missed a Segment behind 39 null windows")
+	}
+	enumeration, err := hs.h.Enumerate(hs.ctx)
+	if err != nil {
+		t.Fatalf("Enumerate: %v", err)
+	}
+	if len(enumeration.Sealed) != 1 {
+		t.Fatalf("sealed Segment count = %d, want 1", len(enumeration.Sealed))
+	}
+	block, err := hs.bs.Get(hs.ctx, enumeration.Sealed[0].CID)
+	if err != nil {
+		t.Fatalf("reading latest sealed Segment: %v", err)
+	}
+	if sample.State != archive.SegmentSealed || sample.EncodedBytes != len(block.RawData()) ||
+		sample.Rows != 1 || sample.Refs != 1 {
+		t.Fatalf("latest sealed sample = %#v, stored canonical bytes = %d", sample, len(block.RawData()))
+	}
 }
 
 // TestCoverageOnlyAdvance: rows may be empty; coverage still advances and the

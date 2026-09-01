@@ -177,6 +177,11 @@ func TestScrapeMovesWhenThingsHappen(t *testing.T) {
 	m.FollowRefusal(metrics.RefusalQuarantined)
 	m.FollowRefusal(metrics.RefusalHandoffBlocked)
 	m.FollowSyncedToFloorLag("all", 20)
+	m.IndexSegment("all", metrics.IndexSegmentOpen, metrics.IndexSegmentWarningBytes, 341, 2416)
+	m.IndexSegment("all", metrics.IndexSegmentSealed, 950534, 3873, 12150)
+	m.IndexSegment("all", metrics.IndexSegmentSealed, 622702, 1337, 8070)
+	m.IndexApply("all", 1048577)
+	m.IndexNodeLimitRefusal("all", metrics.IndexNodeSegment)
 
 	body := scrape(t, m)
 	for _, want := range []struct {
@@ -275,6 +280,17 @@ func TestScrapeMovesWhenThingsHappen(t *testing.T) {
 		{`bloar_follow_refusals_total{reason="quarantined"}`, 1},
 		{`bloar_follow_refusals_total{reason="handoff_blocked"}`, 1},
 		{`bloar_follow_synced_to_floor_lag{head="all"}`, 20},
+		{`bloar_index_segment_encoded_bytes{head="all",state="open"}`, metrics.IndexSegmentWarningBytes},
+		{`bloar_index_segment_rows{head="all",state="open"}`, 341},
+		{`bloar_index_segment_refs{head="all",state="open"}`, 2416},
+		{`bloar_index_segment_encoded_bytes{head="all",state="sealed"}`, 622702},
+		{`bloar_index_segment_rows{head="all",state="sealed"}`, 1337},
+		{`bloar_index_segment_refs{head="all",state="sealed"}`, 8070},
+		{`bloar_index_segment_sealed_encoded_bytes_count{head="all"}`, 2},
+		{`bloar_index_segment_sealed_encoded_bytes_sum{head="all"}`, 1573236},
+		{`bloar_index_segment_sealed_max_encoded_bytes{head="all"}`, 950534},
+		{`bloar_index_apply_encoded_bytes_total{head="all"}`, 1048577},
+		{`bloar_index_node_limit_refusals_total{head="all",node="segment"}`, 1},
 	} {
 		if got := mustSample(t, body, want.series); got != want.value {
 			t.Errorf("%s = %g, want %g", want.series, got, want.value)
@@ -375,6 +391,9 @@ func TestNilMetricsIsTheDisabledState(t *testing.T) {
 	m.FollowPoll(metrics.ChannelHTTPS, metrics.OutcomeOK)
 	m.FollowRefusal(metrics.RefusalSyncedToFloor)
 	m.FollowSyncedToFloorLag("all", 1)
+	m.IndexSegment("all", metrics.IndexSegmentOpen, 1, 1, 1)
+	m.IndexApply("all", 1)
+	m.IndexNodeLimitRefusal("all", metrics.IndexNodeSegment)
 	m.ConfigureFollowSourceMetrics(map[string][]string{"all": {"writer-a", "writer-b"}})
 	m.FollowSourceAvailable("writer-a", true)
 	m.FollowSourceHeadClaim("all", "writer-a", 1, true)
@@ -385,6 +404,30 @@ func TestNilMetricsIsTheDisabledState(t *testing.T) {
 	m.FollowIncomparableActive("all", true)
 	m.FollowIncomparableObserved("all")
 	m.MustRegister(nil)
+}
+
+func TestIndexMetricLabelsStayClosed(t *testing.T) {
+	m := metrics.New()
+	m.IndexSegment("all", "bafy-unbounded-state", 100, 2, 3)
+	m.IndexNodeLimitRefusal("all", "bafy-unbounded-node")
+	m.IndexSegment("all", metrics.IndexSegmentOpen, 100, 2, 3)
+	m.IndexSegment("all", metrics.IndexSegmentOpen, -1, -1, -1)
+	m.IndexSegment("all", metrics.IndexSegmentSealed, 90, 1, 2)
+	m.IndexNodeLimitRefusal("all", metrics.IndexNodeSegment)
+
+	body := scrape(t, m)
+	if strings.Contains(body, "bafy-unbounded") {
+		t.Fatalf("an unbounded Segment state or node kind reached metric labels:\n%s", body)
+	}
+	if got := mustSample(t, body, `bloar_index_segment_encoded_bytes{head="all",state="open"}`); got != 100 {
+		t.Fatalf("negative Segment measurement changed the gauge: %g", got)
+	}
+	assertExactMetricLabels(t, m, "bloar_index_segment_encoded_bytes", "head", "state")
+	assertExactMetricLabels(t, m, "bloar_index_segment_rows", "head", "state")
+	assertExactMetricLabels(t, m, "bloar_index_segment_refs", "head", "state")
+	assertExactMetricLabels(t, m, "bloar_index_segment_sealed_encoded_bytes", "head")
+	assertExactMetricLabels(t, m, "bloar_index_segment_sealed_max_encoded_bytes", "head")
+	assertExactMetricLabels(t, m, "bloar_index_node_limit_refusals_total", "head", "node")
 }
 
 func TestP2PMetricLabelsStayClosed(t *testing.T) {

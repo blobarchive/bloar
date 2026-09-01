@@ -42,6 +42,23 @@ import (
 // namespace prefixes every metric name.
 const namespace = "bloar"
 
+// Segment sizing states and index-node kinds are closed metric dimensions.
+// Callers must use these values; CIDs, slots and window ordinals never become
+// labels.
+const (
+	IndexSegmentOpen   = "open"
+	IndexSegmentSealed = "sealed"
+
+	IndexNodeHead    = "head"
+	IndexNodeDir     = "dir"
+	IndexNodeSegment = "segment"
+
+	// These are the initial operational alert thresholds. The hard ceiling is
+	// owned by archive.MaxIndexNodeBytes and is not duplicated here.
+	IndexSegmentWarningBytes  = 1 << 20
+	IndexSegmentCriticalBytes = 3 << 19
+)
+
 // Ingest rejection reasons (the `reason` label of bloar_ingest_rejects_total).
 // A closed set: these are the only ways spec 7.2's blobs endpoint refuses a
 // body, and the HTTP layer's 400s map onto them.
@@ -295,6 +312,17 @@ type Metrics struct {
 	// indexSegments is the head's sealed segment-window count, derived from its
 	// coverage. Set beside the head-position gauges above.
 	indexSegments *prometheus.GaugeVec
+	// Segment sizing is orthogonal to indexSegments: exact encoded block bytes
+	// and sparse row/ref density, never arithmetic window extent.
+	indexSegmentBytes       *prometheus.GaugeVec
+	indexSegmentRows        *prometheus.GaugeVec
+	indexSegmentRefs        *prometheus.GaugeVec
+	indexSegmentSealedBytes *prometheus.HistogramVec
+	indexSegmentSealedMax   *prometheus.GaugeVec
+	indexApplyBytes         *prometheus.CounterVec
+	indexNodeLimitRefusals  *prometheus.CounterVec
+	indexSegmentMaxMu       sync.Mutex
+	indexSegmentMax         map[string]int
 
 	// Read API (spec 7.1).
 	beaconReads             *prometheus.CounterVec
@@ -459,7 +487,7 @@ type followSourceHeadCell struct {
 // collectors registered alongside bloar's own.
 func New() *Metrics {
 	reg := prometheus.NewRegistry()
-	m := &Metrics{reg: reg}
+	m := &Metrics{reg: reg, indexSegmentMax: make(map[string]int)}
 
 	factory := func(o prometheus.Opts) prometheus.Opts { o.Namespace = namespace; return o }
 	counter := func(name, help string, labels ...string) *prometheus.CounterVec {
@@ -479,6 +507,24 @@ func New() *Metrics {
 	m.quarantined = gauge("head_quarantined", "1 if the head is quarantined and no longer served (spec 11.4).", "head")
 	m.indexSegments = gauge("index_segments",
 		"Sealed segment windows in the head's directory, derived from synced_to (includes empty windows).", "head")
+	m.indexSegmentBytes = gauge("index_segment_encoded_bytes",
+		"Exact canonical DAG-CBOR bytes of the current open or most recently sealed Segment observed by this writer.", "head", "state")
+	m.indexSegmentRows = gauge("index_segment_rows",
+		"Sparse blob-carrying rows in the current open or most recently sealed Segment observed by this writer.", "head", "state")
+	m.indexSegmentRefs = gauge("index_segment_refs",
+		"Blob references in the current open or most recently sealed Segment observed by this writer.", "head", "state")
+	m.indexSegmentSealedBytes = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Name:      "index_segment_sealed_encoded_bytes",
+		Help:      "Exact canonical DAG-CBOR bytes of non-empty Segments when their windows seal.",
+		Buckets:   []float64{64 << 10, 128 << 10, 256 << 10, 512 << 10, 768 << 10, 1 << 20, 5 << 18, 3 << 19, 7 << 18, 2 << 20},
+	}, []string{"head"})
+	m.indexSegmentSealedMax = gauge("index_segment_sealed_max_encoded_bytes",
+		"Largest exact sealed Segment observed for the head during this process lifetime.", "head")
+	m.indexApplyBytes = counter("index_apply_encoded_bytes_total",
+		"Exact DAG-CBOR index bytes submitted by successful ApplyRefs calls, excluding blob payload bytes.", "head")
+	m.indexNodeLimitRefusals = counter("index_node_limit_refusals_total",
+		"Writer mutations refused because a newly encoded index node exceeded the supported per-node limit.", "head", "node")
 
 	m.beaconReads = counter("beacon_reads_total",
 		"Responses served by the beacon-compatible read API, by head and HTTP status class (spec 7.1).", "head", "status")
@@ -917,6 +963,8 @@ func New() *Metrics {
 
 	reg.MustRegister(
 		m.headSyncedTo, m.headDirDepth, m.headCovered, m.rootSwaps, m.adoptions, m.quarantined, m.indexSegments,
+		m.indexSegmentBytes, m.indexSegmentRows, m.indexSegmentRefs,
+		m.indexSegmentSealedBytes, m.indexSegmentSealedMax, m.indexApplyBytes, m.indexNodeLimitRefusals,
 		m.beaconReads, m.beaconLatency, m.publicReadAdmissions, m.publicReadAdmissionCost, m.storeCorruptReads,
 		m.ingestBlobs, m.ingestBytes, m.ingestRejects, m.kzgVerify, m.storePut,
 		m.upstreamReadDuration, m.upstreamReadBytes, m.sourceFetch, m.blockReadDuration,
@@ -1156,6 +1204,67 @@ func (m *Metrics) HeadStructure(head string, segments uint64) {
 		return
 	}
 	m.indexSegments.WithLabelValues(head).Set(float64(segments))
+}
+
+// IndexSegment records the exact bytes and sparse density of an accepted
+// writer Segment. Open samples update on every successful apply; sealed
+// samples additionally feed a process-lifetime histogram and maximum.
+func (m *Metrics) IndexSegment(head, state string, encodedBytes, rows, refs int) {
+	if !m.indexSegmentSnapshot(head, state, encodedBytes, rows, refs) {
+		return
+	}
+	if state != IndexSegmentSealed {
+		return
+	}
+	m.indexSegmentSealedBytes.WithLabelValues(head).Observe(float64(encodedBytes))
+	m.indexSegmentMaxMu.Lock()
+	if encodedBytes > m.indexSegmentMax[head] {
+		m.indexSegmentMax[head] = encodedBytes
+		m.indexSegmentSealedMax.WithLabelValues(head).Set(float64(encodedBytes))
+	}
+	m.indexSegmentMaxMu.Unlock()
+}
+
+// IndexSegmentSnapshot restores accepted open/last-sealed gauges without
+// replaying a historical seal into the event histogram or process-lifetime
+// maximum.
+func (m *Metrics) IndexSegmentSnapshot(head, state string, encodedBytes, rows, refs int) {
+	m.indexSegmentSnapshot(head, state, encodedBytes, rows, refs)
+}
+
+func (m *Metrics) indexSegmentSnapshot(head, state string, encodedBytes, rows, refs int) bool {
+	if m == nil || !validIndexSegmentState(state) || encodedBytes < 0 || rows < 0 || refs < 0 {
+		return false
+	}
+	m.indexSegmentBytes.WithLabelValues(head, state).Set(float64(encodedBytes))
+	m.indexSegmentRows.WithLabelValues(head, state).Set(float64(rows))
+	m.indexSegmentRefs.WithLabelValues(head, state).Set(float64(refs))
+	return true
+}
+
+// IndexApply records exact encoded index DAG bytes for a successful apply.
+func (m *Metrics) IndexApply(head string, encodedBytes uint64) {
+	if m == nil {
+		return
+	}
+	m.indexApplyBytes.WithLabelValues(head).Add(float64(encodedBytes))
+}
+
+// IndexNodeLimitRefusal makes fail-closed publication observable even though
+// accepted-state gauges deliberately remain on the prior generation.
+func (m *Metrics) IndexNodeLimitRefusal(head, node string) {
+	if m == nil || !validIndexNode(node) {
+		return
+	}
+	m.indexNodeLimitRefusals.WithLabelValues(head, node).Inc()
+}
+
+func validIndexSegmentState(state string) bool {
+	return state == IndexSegmentOpen || state == IndexSegmentSealed
+}
+
+func validIndexNode(node string) bool {
+	return node == IndexNodeHead || node == IndexNodeDir || node == IndexNodeSegment
 }
 
 // StoreBlocks records the objects observed remaining by the last GC sweep

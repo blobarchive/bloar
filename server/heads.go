@@ -1012,6 +1012,7 @@ func (h *Heads) Add(head *archive.Head) error {
 	}
 	h.cfg.Metrics.HeadInfo(name, syncedTo, covered, info.DirDepth)
 	h.cfg.Metrics.HeadStructure(name, sealedSegmentWindows(covered, syncedTo, info.OriginSlot, info.SegBits))
+	h.restoreIndexSegmentMetrics(context.Background(), name, head)
 	h.cfg.Metrics.Quarantined(name, false)
 	return nil
 }
@@ -1814,6 +1815,7 @@ func (h *Heads) ReplaceGeneration(ctx context.Context, name string, req Generati
 	params.OriginSlot = req.WindowStart
 	candidate, err := archive.BuildGeneration(ctx, h.cfg.GenerationArchive, params, rows, req.SyncedTo)
 	if err != nil {
+		h.recordIndexNodeLimitRefusal(name, err)
 		return GenerationResponse{}, err
 	}
 
@@ -1865,6 +1867,7 @@ func (h *Heads) ReplaceGeneration(ctx context.Context, name string, req Generati
 	h.reg.Store(prospective)
 	h.installPublication(doc)
 	h.notifyRootSwap(name, candidate)
+	h.recordIndexApply(name, candidate.LastApplyStats())
 	h.dropStaging(context.WithoutCancel(ctx), name, rows)
 	return generationResponse(next, false), nil
 }
@@ -2021,6 +2024,7 @@ func (h *Heads) finishGenerationRetryLocked(ctx context.Context, name string, st
 		params.OriginSlot = st.WindowStart
 		candidate, err = archive.BuildGeneration(ctx, h.cfg.GenerationArchive, params, rows, st.SyncedTo)
 		if err != nil {
+			h.recordIndexNodeLimitRefusal(name, err)
 			return GenerationResponse{}, fmt.Errorf("server: rebuilding committed generation %d of head %q: %w", st.Generation, name, err)
 		}
 		if !candidate.Root().Equals(root) {
@@ -2145,6 +2149,7 @@ func (h *Heads) ApplyRefs(ctx context.Context, name string, rows []archive.RefRo
 	}
 	res, err := candidate.ApplyRefs(ctx, rows, syncedTo)
 	if err != nil {
+		h.recordIndexNodeLimitRefusal(name, err)
 		return archive.ApplyResult{}, err
 	}
 	if res.NoOp {
@@ -2167,6 +2172,7 @@ func (h *Heads) ApplyRefs(ctx context.Context, name string, rows []archive.RefRo
 	if err := h.commitCandidate(ctx, name, candidate, prospective, doc, replace); err != nil {
 		return res, err
 	}
+	h.recordIndexApply(name, res.Index)
 	// Only once the root that names these blobs is durable. Dropping earlier
 	// would leave a crash-restarted node holding blobs that no head references
 	// and no staging row protects, which is exactly the window the rows exist
@@ -2272,6 +2278,7 @@ func (h *Heads) Truncate(ctx context.Context, name string, slot uint64) (cid.Cid
 		root, err = candidate.Truncate(ctx, slot)
 	}
 	if err != nil {
+		h.recordIndexNodeLimitRefusal(name, err)
 		return cid.Undef, err
 	}
 	if root.Equals(base) {
@@ -2293,6 +2300,7 @@ func (h *Heads) Truncate(ctx context.Context, name string, slot uint64) (cid.Cid
 	if err := h.commitCandidate(ctx, name, candidate, prospective, doc, replace); err != nil {
 		return cid.Undef, err
 	}
+	h.recordOpenSegment(ctx, name, candidate)
 	return root, nil
 }
 
@@ -2369,6 +2377,56 @@ func (h *Heads) notifyRootSwap(name string, head *archive.Head) {
 	}
 	h.cfg.Metrics.HeadInfo(name, syncedTo, covered, info.DirDepth)
 	h.cfg.Metrics.HeadStructure(name, sealedSegmentWindows(covered, syncedTo, info.OriginSlot, info.SegBits))
+}
+
+func (h *Heads) recordIndexApply(name string, stats archive.IndexApplyStats) {
+	h.cfg.Metrics.IndexApply(name, stats.EncodedBytes)
+	for _, sample := range stats.Segments {
+		h.cfg.Metrics.IndexSegment(name, string(sample.State), sample.EncodedBytes, sample.Rows, sample.Refs)
+	}
+}
+
+func (h *Heads) recordOpenSegment(ctx context.Context, name string, head *archive.Head) {
+	if h.cfg.Metrics == nil {
+		return
+	}
+	sample, covered, err := head.OpenSegmentSample(ctx)
+	if err != nil {
+		h.cfg.Logger.Warn("reading current open Segment for metrics", "head", name, "err", err)
+		return
+	}
+	if covered {
+		h.cfg.Metrics.IndexSegment(name, string(sample.State), sample.EncodedBytes, sample.Rows, sample.Refs)
+	}
+}
+
+func (h *Heads) restoreIndexSegmentMetrics(ctx context.Context, name string, head *archive.Head) {
+	if h.cfg.Metrics == nil {
+		return
+	}
+	open, covered, err := head.OpenSegmentSample(ctx)
+	if err != nil {
+		h.cfg.Logger.Warn("restoring current open Segment metrics", "head", name, "err", err)
+		return
+	}
+	if covered {
+		h.cfg.Metrics.IndexSegmentSnapshot(name, string(open.State), open.EncodedBytes, open.Rows, open.Refs)
+	}
+	sealed, found, err := head.LatestSealedSegmentSample(ctx)
+	if err != nil {
+		h.cfg.Logger.Warn("restoring latest sealed Segment metrics", "head", name, "err", err)
+		return
+	}
+	if found {
+		h.cfg.Metrics.IndexSegmentSnapshot(name, string(sealed.State), sealed.EncodedBytes, sealed.Rows, sealed.Refs)
+	}
+}
+
+func (h *Heads) recordIndexNodeLimitRefusal(name string, err error) {
+	var oversized *archive.IndexNodeTooLargeError
+	if errors.As(err, &oversized) {
+		h.cfg.Metrics.IndexNodeLimitRefusal(name, string(oversized.Kind))
+	}
 }
 
 // rebuild renders and publishes the document from each head's durable record

@@ -116,7 +116,7 @@ func (h *Head) truncate(ctx context.Context, slot, windowSlots uint64, retainWin
 		}
 	}
 
-	if next.open, err = open.Commit(ctx); err != nil {
+	if next.open, err = h.commitSegment(ctx, open, SegmentOpen); err != nil {
 		return cid.Undef, fmt.Errorf("archive: writing open segment: %w", err)
 	}
 	next.syncedTo, next.covered = slot, true

@@ -106,6 +106,9 @@ type rootSwap struct {
 type stackOpts struct {
 	// dir reuses an existing store directory, for the restart tests.
 	dir string
+	// segBits overrides the test head's window geometry. Zero keeps the small
+	// default used by tests that need to seal windows quickly.
+	segBits uint64
 	// horizon is the immutable horizon in slots. Zero takes the spec default,
 	// which is far too wide to reach in a test.
 	horizon uint64
@@ -198,8 +201,12 @@ func newStack(t *testing.T, opts stackOpts) *stack {
 		t.Fatalf("server.NewHeads: %v", err)
 	}
 
+	segBits := opts.segBits
+	if segBits == 0 {
+		segBits = testSegBits
+	}
 	head, err := server.OpenHead(ctx, archive.Config{Blocks: s.store.Blocks(), Resolver: cat, Cache: cache}, roots,
-		archive.Params{Name: testHead, Net: testNet, OriginSlot: testOrigin, SegBits: testSegBits, FanoutBits: testFanout})
+		archive.Params{Name: testHead, Net: testNet, OriginSlot: testOrigin, SegBits: segBits, FanoutBits: testFanout})
 	if err != nil {
 		t.Fatalf("server.OpenHead: %v", err)
 	}
