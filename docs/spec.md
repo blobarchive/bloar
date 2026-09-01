@@ -181,6 +181,13 @@ head.synced_to = new_synced_to
 write new open Segment (if dirty), new Head; swap root; update pins; publish
 ```
 
+The writer measures the canonical DAG-CBOR bytes from each existing encode of
+a new Segment, DirNode, or Head and refuses any node above the shared 2 MiB
+per-index-node admission boundary before it reaches the blockstore. Such a
+refusal MUST NOT swap or publish the prospective Head. Blocks successfully
+staged earlier in the copy-on-write attempt MAY remain unreachable for GC, but
+the prior root remains current and serviceable.
+
 ### 5.2 seal(w)
 
 ```

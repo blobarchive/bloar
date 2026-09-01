@@ -1450,6 +1450,13 @@ public API.
 | `head_root_swaps_total{head}` | Roots that became current. A writer's are mutations; a follower's are adoptions. |
 | `head_adoptions_total{head}` | Follower only. |
 | `head_quarantined{head}` | **1 is an emergency.** See §6.2. |
+| `index_segments{head}` | Arithmetic count of sealed directory-window extents derived from coverage, **including null/empty windows**. It is not a count of Segment blocks and says nothing about bytes. |
+| `index_segment_encoded_bytes{head,state}` | Writer only. Exact canonical DAG-CBOR bytes of the accepted current `open` or most recently non-null `sealed` Segment. Both states are restored from the durable root at startup; the sealed lookup is a directory-aware reverse search bounded to 1024 DirNode visits, so long null-window runs are not scanned ordinal by ordinal. |
+| `index_segment_rows{head,state}`, `index_segment_refs{head,state}` | Sparse blob-carrying rows and refs beside the exact byte sample. Slots without blobs have no row. |
+| `index_segment_sealed_encoded_bytes{head}` | Writer-only histogram observed when non-empty windows seal. A null window has no Segment block and contributes no sample. Startup does not replay the historical last-sealed gauge into this event series. |
+| `index_segment_sealed_max_encoded_bytes{head}` | Largest exact sealed Segment observed during this writer process lifetime. It deliberately starts fresh after restart. |
+| `index_apply_encoded_bytes_total{head}` | Exact index DAG-CBOR bytes submitted by successful apply_refs calls. Excludes blob payload bytes and does not move when the durable Head commit fails. Use its rate to measure open-window rewrite amplification. |
+| `index_node_limit_refusals_total{head,node}` | Fail-closed writer refusals at the shared 2 MiB index-node boundary. `node` is the closed set `head`/`dir`/`segment`; accepted-state gauges deliberately remain on the prior generation. |
 | `beacon_reads_total{head,status}` | `status` is `2xx`/`4xx`/`5xx`. 4xx is normal (404 = no such blob). |
 | `beacon_read_duration_seconds{head}` | Nitro syncs one slot at a time, serially: this gates sync speed. |
 | `public_read_admissions_total{outcome}` | Weighted public GET admission decisions. `outcome` is the fixed set `admitted`/`rejected_global`/`rejected_client`/`rejected_canceled`; no path or client labels. |
@@ -1561,6 +1568,37 @@ against wall-clock slot rather than against nothing:
 ~1 hour behind. Tune per head: an `arbitrum-one` head with `fetch_blobs: false`
 trails the `all` head by design, so its threshold is looser. Gate on
 `bloar_head_covered == 1`, or a fresh empty head pages you at 8.6 million.
+
+**Segment sizing.** These are distinct operational quantities: sparse
+row/reference density, exact encoded Segment bytes, and arithmetic directory
+extent. Never infer one from another. The initial thresholds leave two response
+bands below the reader's 2 MiB hard boundary:
+
+    max by (head) (
+      bloar_index_segment_encoded_bytes
+      or bloar_index_segment_sealed_max_encoded_bytes
+    ) > 1 * 1024 * 1024
+
+    max by (head) (
+      bloar_index_segment_encoded_bytes
+      or bloar_index_segment_sealed_max_encoded_bytes
+    ) > 1.5 * 1024 * 1024
+
+The first expression is a warning; the second is critical. Correlate either
+with `index_segment_rows` and `index_segment_refs`, not with
+`index_segments`. A single Segment can later be smaller because
+density is not monotonic, so an observed crossing is evidence even if the latest
+gauge falls back. The process-lifetime maximum keeps that evidence until
+restart; retained histograms preserve the distribution across restarts.
+
+An attempted crossing of the hard boundary is independently critical:
+
+    increase(bloar_index_node_limit_refusals_total[5m]) > 0
+
+The writer has kept the prior generation current, but coverage cannot advance
+until density or index geometry is remediated. Confirm that root swaps stopped,
+the prior root still serves, and the refusal's `node` class before
+changing any head.
 
 **Quarantine.** Page on this.
 

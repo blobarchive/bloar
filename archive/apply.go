@@ -27,6 +27,7 @@ type ApplyResult struct {
 	SyncedTo uint64
 	Root     cid.Cid
 	NoOp     bool
+	Index    IndexApplyStats
 }
 
 // ApplyRefs adds rows and advances coverage to newSyncedTo (spec 5.1).
@@ -78,6 +79,9 @@ func (h *Head) ApplyRefs(ctx context.Context, rows []RefRow, newSyncedTo uint64)
 	if err != nil {
 		return ApplyResult{}, err
 	}
+	stats := IndexApplyStats{}
+	h.applyStats = &stats
+	defer func() { h.applyStats = nil }()
 
 	next := *st
 	next.root = cid.Undef
@@ -129,14 +133,16 @@ func (h *Head) ApplyRefs(ctx context.Context, rows []RefRow, newSyncedTo uint64)
 		return ApplyResult{}, fmt.Errorf("archive: internal: %d rows fell outside windows [%d, %d]", len(resolved)-ri, w0, w1)
 	}
 
-	if next.open, err = open.Commit(ctx); err != nil {
+	if next.open, err = h.commitSegment(ctx, open, SegmentOpen); err != nil {
 		return ApplyResult{}, fmt.Errorf("archive: writing open segment: %w", err)
 	}
 	next.syncedTo, next.covered = newSyncedTo, true
 	if err := h.publish(ctx, &next); err != nil {
 		return ApplyResult{}, err
 	}
-	return ApplyResult{SyncedTo: next.syncedTo, Root: next.root}, nil
+	stats.Segments = append([]SegmentSample(nil), stats.Segments...)
+	h.lastApplyStats = stats
+	return ApplyResult{SyncedTo: next.syncedTo, Root: next.root, Index: stats}, nil
 }
 
 // seal closes window w: the open segment becomes a directory entry and a fresh
@@ -155,7 +161,7 @@ func (h *Head) seal(ctx context.Context, st *state, open *core.Pointer[schema.Se
 	// so every window must take its turn whether or not it has refs.
 	var sealed cid.Cid
 	if len(seg.Rows) > 0 {
-		if sealed, err = open.Commit(ctx); err != nil {
+		if sealed, err = h.commitSegment(ctx, open, SegmentSealed); err != nil {
 			return nil, fmt.Errorf("archive: sealing segment for window %d: %w", w, err)
 		}
 	}
@@ -165,6 +171,191 @@ func (h *Head) seal(ctx context.Context, st *state, open *core.Pointer[schema.Se
 		return nil, err
 	}
 	return h.segs.NewNode(&schema.Segment{Slot0: windowStart(w+1, st.params.SegBits)}), nil
+}
+
+// commitSegment commits a dirty Segment exactly once and records the byte
+// length produced by that encode. A clean pointer at seal time is the immutable
+// block written by an earlier apply; its bytes are read from the blockstore
+// rather than re-encoded, preserving the seal-as-link invariant.
+func (h *Head) commitSegment(ctx context.Context, segment *core.Pointer[schema.Segment], state SegmentState) (cid.Cid, error) {
+	value, err := segment.Load(ctx)
+	if err != nil {
+		return cid.Undef, err
+	}
+	dirty := segment.IsDirty()
+	h.segmentEncodeState = state
+	h.segmentEncodedBytes = 0
+	id, err := segment.Commit(ctx)
+	h.segmentEncodeState = ""
+	if err != nil {
+		return cid.Undef, err
+	}
+	encodedBytes := h.segmentEncodedBytes
+	if !dirty {
+		block, err := h.cfg.Blocks.Get(ctx, id)
+		if err != nil {
+			return cid.Undef, fmt.Errorf("archive: reading committed segment %s for exact size: %w", id, err)
+		}
+		encodedBytes = len(block.RawData())
+	}
+	refs := 0
+	for _, row := range value.Rows {
+		refs += len(row.Entries)
+	}
+	if h.applyStats != nil {
+		h.applyStats.Segments = append(h.applyStats.Segments, SegmentSample{
+			State: state, EncodedBytes: encodedBytes, Rows: len(value.Rows), Refs: refs,
+		})
+	}
+	return id, nil
+}
+
+// LastApplyStats returns an independent copy of the most recent successful
+// ApplyRefs measurement. Complete-generation builders use it after their
+// durable selector commit; ordinary callers receive the same data in
+// ApplyResult.
+func (h *Head) LastApplyStats() IndexApplyStats {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	stats := h.lastApplyStats
+	stats.Segments = append([]SegmentSample(nil), stats.Segments...)
+	return stats
+}
+
+// OpenSegmentSample reads the current immutable open Segment and returns its
+// exact stored bytes and density. It is used to initialize metrics from a
+// durable root after restart without encoding or mutating anything.
+func (h *Head) OpenSegmentSample(ctx context.Context) (SegmentSample, bool, error) {
+	st := h.cur.Load()
+	if !st.covered {
+		return SegmentSample{}, false, nil
+	}
+	_, sample, err := h.readSegmentSample(ctx, st.open, SegmentOpen)
+	return sample, err == nil, err
+}
+
+// MaxLatestSealedSampleDirNodes bounds the directory-aware reverse search used
+// to restore the last-sealed metric at startup.
+const MaxLatestSealedSampleDirNodes = 1024
+
+// LatestSealedSegmentSample returns the nearest non-null sealed Segment behind
+// the current open window. It searches the radix tree from its right edge,
+// skipping null child ranges without scanning their window ordinals.
+func (h *Head) LatestSealedSegmentSample(ctx context.Context) (SegmentSample, bool, error) {
+	st := h.cur.Load()
+	if !st.covered || st.dirDepth == 0 {
+		return SegmentSample{}, false, nil
+	}
+	openW, err := h.openOrd(ctx, st)
+	if err != nil {
+		return SegmentSample{}, false, err
+	}
+	base := st.dirBase()
+	sealed := openW - base
+	budget := MaxLatestSealedSampleDirNodes
+	id, index, ok, err := h.latestSealedInDir(ctx, st.dir, st.dirDepth, st.params.FanoutBits, sealed, &budget)
+	if err != nil || !ok {
+		return SegmentSample{}, false, err
+	}
+	segment, sample, err := h.readSegmentSample(ctx, id, SegmentSealed)
+	if err != nil {
+		return SegmentSample{}, false, err
+	}
+	wantSlot0 := windowStart(base+index, st.params.SegBits)
+	if segment.Slot0 != wantSlot0 || len(segment.Rows) == 0 {
+		return SegmentSample{}, false, fmt.Errorf(
+			"archive: latest sealed segment %s has slot0=%d rows=%d, path requires non-empty slot0=%d",
+			id, segment.Slot0, len(segment.Rows), wantSlot0)
+	}
+	return sample, true, nil
+}
+
+// readSegmentSample performs one validating block read. The same raw bytes are
+// both the decode input and the measurement source, so startup cannot drift
+// from the writer's canonical block length or decode an over-budget node.
+func (h *Head) readSegmentSample(
+	ctx context.Context,
+	id cid.Cid,
+	state SegmentState,
+) (*schema.Segment, SegmentSample, error) {
+	block, err := h.cfg.Blocks.Get(ctx, id)
+	if err != nil {
+		return nil, SegmentSample{}, fmt.Errorf("archive: reading %s segment %s: %w", state, id, err)
+	}
+	data := block.RawData()
+	if len(data) > MaxIndexNodeBytes {
+		return nil, SegmentSample{}, fmt.Errorf(
+			"archive: %s segment %s is %d encoded bytes, above the %d-byte per-node admission budget",
+			state, id, len(data), MaxIndexNodeBytes)
+	}
+	segment, err := schema.DecodeSegment(data)
+	if err != nil {
+		return nil, SegmentSample{}, fmt.Errorf("archive: decoding %s segment %s: %w", state, id, err)
+	}
+	refs := 0
+	for _, row := range segment.Rows {
+		refs += len(row.Entries)
+	}
+	return segment, SegmentSample{
+		State: state, EncodedBytes: len(data), Rows: len(segment.Rows), Refs: refs,
+	}, nil
+}
+
+// latestSealedInDir returns the greatest defined leaf index below limit. Empty
+// subtrees are skipped by page links, so a long run of null windows costs no
+// per-window reads. budget bounds even a malformed or extraordinarily sparse
+// tree by logical DirNode visits.
+func (h *Head) latestSealedInDir(
+	ctx context.Context,
+	node cid.Cid,
+	depth, fanoutBits, limit uint64,
+	budget *int,
+) (cid.Cid, uint64, bool, error) {
+	if !node.Defined() || depth == 0 || limit == 0 {
+		return cid.Undef, 0, false, nil
+	}
+	if *budget == 0 {
+		return cid.Undef, 0, false, fmt.Errorf(
+			"archive: latest sealed Segment search exceeded %d DirNode visits",
+			MaxLatestSealedSampleDirNodes)
+	}
+	*budget = *budget - 1
+	page, err := h.dirs.GetNode(ctx, node)
+	if err != nil {
+		return cid.Undef, 0, false, fmt.Errorf("archive: reading dirnode %s: %w", node, err)
+	}
+	if len(page.Kids) == 0 {
+		return cid.Undef, 0, false, nil
+	}
+
+	childCapacity := capacity(depth-1, fanoutBits)
+	highest := (limit - 1) / childCapacity
+	if highest >= uint64(len(page.Kids)) {
+		highest = uint64(len(page.Kids) - 1)
+	}
+	for child := highest + 1; child > 0; {
+		child--
+		id := page.Kids[child]
+		if !id.Defined() {
+			continue
+		}
+		base := child * childCapacity
+		childLimit := childCapacity
+		if child == highest && limit-base < childLimit {
+			childLimit = limit - base
+		}
+		if depth == 1 {
+			return id, child, true, nil
+		}
+		found, offset, ok, err := h.latestSealedInDir(ctx, id, depth-1, fanoutBits, childLimit, budget)
+		if err != nil {
+			return cid.Undef, 0, false, err
+		}
+		if ok {
+			return found, base + offset, true, nil
+		}
+	}
+	return cid.Undef, 0, false, nil
 }
 
 // validateShape enforces spec 5.1 step 1.

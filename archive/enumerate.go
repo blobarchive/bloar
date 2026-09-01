@@ -19,10 +19,17 @@ import (
 // growth room without permitting a tiny repeated-child DAG to allocate or walk
 // without limit.
 const (
-	MaxEnumerationOutputs      = 1 << 20 // non-null sealed Segment results
-	MaxEnumerationPaths        = 1 << 21 // logical DirNode positions
-	MaxEnumerationUniqueNodes  = 1 << 22 // Head + open + dirs + sealed
-	MaxEnumerationNodeBytes    = 2 << 20 // one encoded index block
+	MaxEnumerationOutputs     = 1 << 20 // non-null sealed Segment results
+	MaxEnumerationPaths       = 1 << 21 // logical DirNode positions
+	MaxEnumerationUniqueNodes = 1 << 22 // Head + open + dirs + sealed
+	// MaxIndexNodeBytes is the shared writer and reader boundary for one
+	// encoded DAG-CBOR index block. Writers refuse to store a new Head,
+	// DirNode or Segment above it; readers refuse a remote block above it
+	// before decoding.
+	MaxIndexNodeBytes = 2 << 20
+	// MaxEnumerationNodeBytes retains the reader-budget name used by callers.
+	// It aliases the shared boundary so admission and publication cannot drift.
+	MaxEnumerationNodeBytes    = MaxIndexNodeBytes
 	MaxEnumerationDecodedBytes = uint64(4) << 30
 	MaxEnumerationDuration     = time.Hour
 )

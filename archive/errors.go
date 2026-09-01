@@ -10,6 +10,37 @@ import (
 	"github.com/blobarchive/bloar/schema"
 )
 
+// IndexNodeKind is the closed set of DAG-CBOR node types written by a Head.
+type IndexNodeKind string
+
+const (
+	IndexNodeHead    IndexNodeKind = "head"
+	IndexNodeDir     IndexNodeKind = "dir"
+	IndexNodeSegment IndexNodeKind = "segment"
+)
+
+// IndexNodeTooLargeError reports a newly encoded index node that cannot be
+// admitted by supported readers. The writer returns it before handing the
+// bytes to the blockstore, so no root containing the node can become current.
+// Segment fields are populated only when Kind is IndexNodeSegment.
+type IndexNodeTooLargeError struct {
+	Kind         IndexNodeKind
+	EncodedBytes int
+	LimitBytes   int
+	State        SegmentState
+	Rows         int
+	Refs         int
+}
+
+func (e *IndexNodeTooLargeError) Error() string {
+	detail := ""
+	if e.Kind == IndexNodeSegment {
+		detail = fmt.Sprintf(" (%s, rows=%d, refs=%d)", e.State, e.Rows, e.Refs)
+	}
+	return fmt.Sprintf("archive: refusing newly encoded %s index node of %d bytes%s: supported per-node limit is %d bytes",
+		e.Kind, e.EncodedBytes, detail, e.LimitBytes)
+}
+
 // BlobResolver maps a versioned hash to the CID of its blob block. It is the
 // read side of the blob catalog (spec 6.1), which the ingest path writes.
 //
